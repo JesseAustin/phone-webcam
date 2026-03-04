@@ -1,0 +1,565 @@
+package phone.webcam.phonewebcam.service
+
+import android.app.*
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaCodec
+import android.media.MediaCodecInfo
+import android.media.MediaFormat
+import android.media.MediaRecorder
+import android.os.Binder
+import android.os.Build
+import android.os.IBinder
+import android.util.Log
+import android.view.Surface
+import androidx.core.app.NotificationCompat
+import kotlinx.coroutines.*
+import phone.webcam.phonewebcam.R
+import phone.webcam.phonewebcam.camera.CameraManager
+import phone.webcam.phonewebcam.network.RtpSender
+import phone.webcam.phonewebcam.encoder.H264Encoder
+import phone.webcam.phonewebcam.security.SrtpKeyDerivation
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.util.concurrent.atomic.AtomicLong
+
+class CameraStreamService : Service() {
+
+    companion object {
+        private const val TAG = "PhoneWebcam"
+
+        private const val NOTIFICATION_ID = 1001
+        private const val CHANNEL_ID      = "phone_webcam_stream"
+        private const val CHANNEL_NAME    = "Camera Stream"
+
+        const val ACTION_START_STREAM = "phone.webcam.START_STREAM"
+        const val ACTION_STOP_STREAM  = "phone.webcam.STOP_STREAM"
+        const val EXTRA_TARGET_IP     = "target_ip"
+        const val EXTRA_TARGET_PORT   = "target_port"
+        const val EXTRA_RESOLUTION    = "resolution"
+        const val EXTRA_BITRATE_MBPS  = "extra_bitrate_mbps"
+        const val EXTRA_PASSWORD      = "extra_password"
+
+        // Static salt for SRTP key derivation.
+        // Must match what the OBS plugin uses.
+        private val SRTP_SALT = "PhoneWebcamSRTP".toByteArray()
+    }
+
+    private val binder = LocalBinder()
+    private var cameraManager: CameraManager? = null
+    private var rtpSender: RtpSender? = null
+    private var audioSender: RtpSender? = null
+    private var h264Encoder: H264Encoder? = null
+    private var drainJob: Job? = null
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    @Volatile private var isStreaming = false
+    @Volatile private var previewSurface: Surface? = null
+    private val senderLock = Any()
+
+    private val frameCount = AtomicLong(0)
+    private val bytesSent  = AtomicLong(0)
+    private var startTime  = 0L
+    private var selectedResolution = CameraManager.StreamResolution.RES_1080P
+    private var bitrateMbps: Int = 20
+    private var currentPassword: String = ""
+
+    @Volatile private var audioRecord: AudioRecord? = null
+    @Volatile private var audioCodec: MediaCodec? = null
+    @Volatile private var audioThread: Thread? = null
+    private var isMicEnabled = true
+
+    fun setMicEnabled(enabled: Boolean) {
+        isMicEnabled = enabled
+    }
+
+    fun startAudioStream(host: String, port: Int) {
+        val sampleRate = 44100
+        val channelConfig = AudioFormat.CHANNEL_IN_MONO
+        val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+        val minBufSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+
+        // Check permission FIRST
+        if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED) {
+            Log.e(TAG, "RECORD_AUDIO permission not granted")
+            return
+        }
+
+        // Create AudioRecord
+        audioRecord = AudioRecord(
+            MediaRecorder.AudioSource.MIC,
+            sampleRate,
+            channelConfig,
+            audioFormat,
+            minBufSize * 4
+        )
+
+        // Verify initialization
+        if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord failed to initialize")
+            audioRecord?.release()
+            audioRecord = null
+            return
+        }
+
+        // Set up the RtpSender for audio
+        synchronized(senderLock) {
+            audioSender?.close()
+            audioSender = createRtpSender(host, port)
+        }
+
+        // Now create codec
+        audioCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC).also { codec ->
+            val format = MediaFormat.createAudioFormat(
+                MediaFormat.MIMETYPE_AUDIO_AAC,
+                sampleRate,
+                1
+            )
+            format.setInteger(MediaFormat.KEY_BIT_RATE, 64000)
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, minBufSize * 4)
+            format.setInteger(
+                MediaFormat.KEY_AAC_PROFILE,
+                MediaCodecInfo.CodecProfileLevel.AACObjectLC
+            )
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            codec.start()
+        }
+
+        // SAFE to start recording
+        audioRecord?.startRecording()
+
+        audioThread = Thread {
+            val FRAME_SAMPLES = 1024
+            val pcmBuf = ByteArray(FRAME_SAMPLES * 2)  // 16-bit = 2 bytes per sample
+            val bufInfo = MediaCodec.BufferInfo()
+
+            while (!Thread.currentThread().isInterrupted) {
+                try {
+                    val codec = audioCodec ?: break
+                    val record = audioRecord ?: break
+
+                    // Feed PCM into encoder
+                    val inputIdx = codec.dequeueInputBuffer(10000)
+                    if (inputIdx >= 0) {
+                        val inputBuf = codec.getInputBuffer(inputIdx) ?: continue
+                        val bytesRead = if (isMicEnabled) {
+                            record.read(pcmBuf, 0, pcmBuf.size)
+                        } else {
+                            // Send silence when muted
+                            pcmBuf.fill(0)
+                            pcmBuf.size
+                        }
+
+                        if (bytesRead > 0) {
+                            inputBuf.clear()
+                            inputBuf.put(pcmBuf, 0, bytesRead)
+                            codec.queueInputBuffer(inputIdx, 0, bytesRead, System.nanoTime() / 1000, 0)
+                        }
+                    }
+
+                    // Get encoded output and send via RTP
+                    val outputIdx = codec.dequeueOutputBuffer(bufInfo, 10000)
+                    if (outputIdx >= 0) {
+                        val outputBuf = codec.getOutputBuffer(outputIdx) ?: continue
+                        val aacData = ByteArray(bufInfo.size)
+                        outputBuf.get(aacData)
+                        codec.releaseOutputBuffer(outputIdx, false)
+
+                        // Skip codec config packets
+                        if (bufInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) continue
+
+                        // Simple RTP packet: ADTS header + AAC data
+                        val adts = makeAdtsHeader(aacData.size, sampleRate, 1)
+                        val payload = adts + aacData
+                        val rtpTimestamp = (bufInfo.presentationTimeUs * 44100 / 1_000_000).toInt()
+
+                        synchronized(senderLock) {
+                            audioSender?.sendRtp(payload, rtpTimestamp, 97)
+                        }
+                    }
+                } catch (e: IllegalStateException) {
+                    // Buffer becomes inaccessible if codec is stopped
+                    break
+                } catch (e: Exception) {
+                    Log.e(TAG, "Audio thread loop error: ${e.message}")
+                    break
+                }
+            }
+        }.also { it.start() }
+    }
+
+    fun stopAudioStream() {
+        audioThread?.interrupt()
+        audioThread?.join()
+        audioThread = null
+
+        val record = audioRecord
+        audioRecord = null
+        try {
+            if (record?.state == AudioRecord.STATE_INITIALIZED) {
+                record.stop()
+            }
+            record?.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping AudioRecord: ${e.message}")
+        }
+
+        val codec = audioCodec
+        audioCodec = null
+        try {
+            codec?.stop()
+            codec?.release()
+        } catch (e: Exception) {
+            Log.e(TAG, "Error stopping AudioCodec: ${e.message}")
+        }
+
+        synchronized(senderLock) {
+            audioSender?.close()
+            audioSender = null
+        }
+    }
+
+    private fun makeAdtsHeader(aacLength: Int, sampleRate: Int, channels: Int): ByteArray {
+        val freqIdx = when (sampleRate) {
+            96000 -> 0; 88200 -> 1; 64000 -> 2; 48000 -> 3
+            44100 -> 4; 32000 -> 5; 24000 -> 6; 22050 -> 7
+            16000 -> 8; 12000 -> 9; 11025 -> 10; 8000 -> 11
+            else -> 4
+        }
+        val frameLen = aacLength + 7
+        return byteArrayOf(
+            0xFF.toByte(), 0xF1.toByte(),
+            (0x40 or (freqIdx shl 2) or (channels shr 2)).toByte(),
+            ((channels and 3 shl 6) or (frameLen shr 11)).toByte(),
+            (frameLen shr 3 and 0xFF).toByte(),
+            (frameLen and 7 shl 5 or 0x1F).toByte(),
+            0xFC.toByte()
+        )
+    }
+
+    inner class LocalBinder : Binder() {
+        fun getService(): CameraStreamService = this@CameraStreamService
+    }
+
+    override fun onBind(intent: Intent?): IBinder = binder
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+        cameraManager = CameraManager(this)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START_STREAM -> {
+                val ip   = intent.getStringExtra(EXTRA_TARGET_IP) ?: "192.168.1.100"
+                val port = intent.getIntExtra(EXTRA_TARGET_PORT, 9000)
+                val resName = intent.getStringExtra(EXTRA_RESOLUTION) ?: "RES_1080P"
+                bitrateMbps = intent.getIntExtra(EXTRA_BITRATE_MBPS, 20)
+                currentPassword = intent.getStringExtra(EXTRA_PASSWORD) ?: ""
+
+                val resolution = try {
+                    CameraManager.StreamResolution.valueOf(resName)
+                } catch (e: IllegalArgumentException) {
+                    CameraManager.StreamResolution.RES_1080P
+                }
+                startStreaming(ip, port, resolution)
+            }
+            ACTION_STOP_STREAM -> stopStreaming()
+        }
+        return START_STICKY
+    }
+
+    fun setPreviewSurface(surface: Surface) {
+        previewSurface = surface
+        if (isStreaming) {
+            serviceScope.launch {
+                cameraManager?.startCapture(
+                    resolution = selectedResolution,
+                    streamSurface = h264Encoder?.inputSurface,
+                    previewSurface = previewSurface
+                )
+            }
+        }
+    }
+
+    fun switchCamera(useFront: Boolean) {
+        if (!isStreaming) return
+        serviceScope.launch {
+            cameraManager?.stopCapture()
+            cameraManager?.startCapture(
+                resolution = selectedResolution,
+                streamSurface = h264Encoder?.inputSurface,
+                previewSurface = previewSurface,
+                useFrontCamera = useFront
+            )
+            h264Encoder?.requestKeyFrame()
+        }
+    }
+
+    fun requestKeyFrame() {
+        h264Encoder?.requestKeyFrame()
+    }
+
+    fun setRtpDestination(ip: String, port: Int) {
+        synchronized(senderLock) {
+            rtpSender?.close()
+            rtpSender = createRtpSender(ip, port)
+            audioSender?.close()
+            audioSender = createRtpSender(ip, port + 1)
+        }
+        h264Encoder?.requestKeyFrame()
+    }
+
+    fun redirectStream(newIp: String, newPort: Int) {
+        if (!isStreaming) return
+
+        serviceScope.launch {
+            val oldSender: RtpSender?
+            val oldAudioSender: RtpSender?
+            synchronized(senderLock) {
+                oldSender = rtpSender
+                rtpSender = createRtpSender(newIp, newPort)
+                oldAudioSender = audioSender
+                audioSender = createRtpSender(newIp, newPort + 1)
+            }
+            oldSender?.close()
+            oldAudioSender?.close()
+
+            val encoder = h264Encoder
+            val sender  = synchronized(senderLock) { rtpSender }
+            if (encoder != null && sender != null) {
+                encoder.cachedSps?.let { sps ->
+                    extractNalsFromAnnexB(sps).forEach { sender.sendNal(it, 0, true) }
+                }
+                encoder.cachedPps?.let { pps ->
+                    extractNalsFromAnnexB(pps).forEach { sender.sendNal(it, 0, true) }
+                }
+            }
+            h264Encoder?.requestKeyFrame()
+            updateNotification("Streaming to $newIp:$newPort")
+        }
+    }
+
+    private fun createRtpSender(ip: String, port: Int): RtpSender {
+        Log.d("RtpSender", "createRtpSender: password empty=${currentPassword.isEmpty()}")
+
+        rtpSender?.reset();
+
+        return if (currentPassword.isNotEmpty()) {
+            val (key, salt) = SrtpKeyDerivation.deriveKeys(currentPassword, SRTP_SALT)
+            RtpSender(ip, port, key, salt)
+        } else {
+            RtpSender(ip, port)
+        }
+    }
+
+    fun startStreaming(
+        targetIp: String,
+        targetPort: Int,
+        resolution: CameraManager.StreamResolution
+    ) {
+        frameCount.set(0)
+        bytesSent.set(0)
+        startTime = System.currentTimeMillis()
+
+        serviceScope.launch {
+            try {
+                selectedResolution = resolution
+
+                if (isStreaming) {
+                    teardown()
+                }
+
+                isStreaming = false
+
+                val notif = createNotification("Connecting...")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                    startForeground(NOTIFICATION_ID, notif,
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+                } else {
+                    startForeground(NOTIFICATION_ID, notif)
+                }
+
+                synchronized(senderLock) {
+                    rtpSender?.close()
+                    rtpSender = createRtpSender(targetIp, targetPort)
+                }
+
+                h264Encoder = H264Encoder(
+                    selectedResolution.width,
+                    selectedResolution.height,
+                    bitrateMbps * 1_000_000
+                ).also { encoder ->
+                    encoder.onEncodedFrame = { nal, pts, isLast ->
+                        bytesSent.addAndGet(nal.size.toLong())
+                        if (isLast) frameCount.incrementAndGet()
+
+                        if (isLast) Log.d(TAG, "NAL_SEND pts=$pts wall=${System.currentTimeMillis()}")
+
+                        val rtpTimestamp = (pts / 1000).toInt()
+                        synchronized(senderLock) {
+                            rtpSender?.sendNal(nal, rtpTimestamp, isLast)
+                        }
+                    }
+                    encoder.start()
+                    encoder.requestKeyFrame()
+                }
+
+                isStreaming = true
+                updateNotification("Streaming to $targetIp:$targetPort")
+
+                drainJob = serviceScope.launch(Dispatchers.Default) {
+                    while (isActive && isStreaming) {
+                        h264Encoder?.drainOutput()
+                        yield()
+                    }
+                }
+
+                cameraManager?.startCapture(
+                    resolution,
+                    h264Encoder?.inputSurface,
+                    previewSurface
+                )
+
+                startAudioStream(targetIp, targetPort + 1)
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Pipeline error", e)
+                stopStreaming()
+            }
+        }
+    }
+
+    private suspend fun teardown() {
+        isStreaming = false
+        drainJob?.cancelAndJoin()
+        drainJob = null
+
+        stopAudioStream()
+
+        withContext(Dispatchers.IO) {
+            cameraManager?.stopCapture()
+        }
+
+        h264Encoder?.stop()
+        h264Encoder = null
+
+        synchronized(senderLock) {
+            rtpSender?.close()
+            rtpSender = null
+            audioSender?.close()
+            audioSender = null
+        }
+        cameraManager?.stopBackgroundThread()
+    }
+
+    fun stopStreaming() {
+        serviceScope.launch {
+            teardown()
+            updateNotification("Stream stopped")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    fun extractNalsFromAnnexB(buffer: ByteArray): List<ByteArray> {
+        val nals              = mutableListOf<ByteArray>()
+        val startCodeIndices  = mutableListOf<Int>()
+
+        for (i in 0..buffer.size - 3) {
+            if (buffer[i] == 0x00.toByte() && buffer[i + 1] == 0x00.toByte()) {
+                if (buffer[i + 2] == 0x01.toByte()) {
+                    startCodeIndices.add(i)
+                } else if (i + 3 < buffer.size &&
+                    buffer[i + 2] == 0x00.toByte() &&
+                    buffer[i + 3] == 0x01.toByte()) {
+                    startCodeIndices.add(i)
+                }
+            }
+        }
+
+        for (j in startCodeIndices.indices) {
+            val startIndex      = startCodeIndices[j]
+            val startCodeLength = if (startIndex + 3 < buffer.size &&
+                buffer[startIndex + 2] == 0x00.toByte() &&
+                buffer[startIndex + 3] == 0x01.toByte()) 4 else 3
+            val nalDataStart    = startIndex + startCodeLength
+            val endIndex        = if (j < startCodeIndices.size - 1)
+                startCodeIndices[j + 1] else buffer.size
+            if (endIndex > nalDataStart)
+                nals.add(buffer.copyOfRange(nalDataStart, endIndex))
+        }
+
+        return nals
+    }
+
+    private fun createNotification(contentText: String): Notification {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        val contentPi = PendingIntent.getActivity(this, 0, launchIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        val stopPi = PendingIntent.getService(this, 0,
+            Intent(this, CameraStreamService::class.java).apply { action = ACTION_STOP_STREAM },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Phone Webcam").setContentText(contentText)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentIntent(contentPi)
+            .addAction(R.drawable.ic_stop, "Stop", stopPi)
+            .setOngoing(true).build()
+    }
+
+    private fun updateNotification(contentText: String) {
+        (getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
+            .notify(NOTIFICATION_ID, createNotification(contentText))
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(CHANNEL_ID, CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_LOW).apply {
+                description = "Camera streaming"
+                setShowBadge(false)
+            }
+            getSystemService(NotificationManager::class.java).createNotificationChannel(ch)
+        }
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        serviceScope.launch { teardown() }.invokeOnCompletion {
+            serviceScope.cancel()
+        }
+    }
+
+    fun getStreamingStatus(): StreamStatus {
+        val elapsed = (System.currentTimeMillis() - startTime) / 1000
+        val fc      = frameCount.get()
+        return StreamStatus(
+            isStreaming = isStreaming,
+            frameCount  = fc,
+            bytesSent   = bytesSent.get(),
+            fps         = if (isStreaming && elapsed > 0) fc / elapsed else 0,
+            targetInfo  = "RTP active",
+            elapsedSeconds = elapsed,
+            bitrateMbps = bitrateMbps * 1_000_000
+        )
+    }
+
+    data class StreamStatus(
+        val isStreaming: Boolean,
+        val frameCount: Long,
+        val bytesSent: Long,
+        val elapsedSeconds: Long,
+        val fps: Long,
+        val targetInfo: String,
+        val bitrateMbps: Any
+    )
+}
