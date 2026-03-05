@@ -204,7 +204,7 @@ class RtpSender(
         }
 
 
-        Log.d("RtpSender", "SRTP: rtpLen=$rtpLength finalLen=$finalLen encrypted=${srtpContext != null}")
+        //Log.d("RtpSender", "SRTP: rtpLen=$rtpLength finalLen=$finalLen encrypted=${srtpContext != null}")
 
         if (finalLen > 0) {
             socket.send(DatagramPacket(packet, finalLen, address, port))

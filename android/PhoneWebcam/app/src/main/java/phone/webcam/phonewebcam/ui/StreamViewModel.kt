@@ -55,7 +55,15 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
             val binder = service as CameraStreamService.LocalBinder
             streamService = binder.getService()
             isBound = true
-            _pendingPreviewSurface?.let { streamService?.setPreviewSurface(it) }
+
+            // The SurfaceView's surfaceCreated fires before the service is bound, so
+            // setPreviewSurface() was a no-op. Flush the pending surface now.
+            // setPreviewSurface() calls attachPreviewSurface() if already streaming,
+            // or just stores it so startCapture() picks it up if the camera isn't open yet.
+            _pendingPreviewSurface?.let { surface ->
+                streamService?.setPreviewSurface(surface)
+            }
+
             lastHandshakeIp?.let { ip ->
                 streamService?.setRtpDestination(ip, lastHandshakePort)
             }
@@ -137,8 +145,9 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun setPreviewSurface(surface: Surface) {
+    fun setPreviewSurface(surface: Surface?) {
         _pendingPreviewSurface = surface
+        // Always forward to service — it will attach or detach as appropriate
         streamService?.setPreviewSurface(surface)
     }
 
@@ -300,8 +309,13 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
             putExtra(CameraStreamService.EXTRA_RESOLUTION, state.selectedResolution.name)
             putExtra(CameraStreamService.EXTRA_PASSWORD, state.password)
         }
-        context.startForegroundService(intent)
+
+        if (streamService == null) {
+            context.startForegroundService(intent)
+        }
+
         context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+
         _uiState.value = state.copy(isStreaming = true, statusMessage = "Starting stream...")
         Log.i(TAG, "Stream started: ${state.targetIp}:${state.targetPort}")
     }
@@ -424,7 +438,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         handshakeServer.stop()
         networkDiscovery.stopAdvertising()
-        stopStreaming()
+        //stopStreaming()
+        //streamService?.setPreviewSurface(null)
         super.onCleared()
     }
 }

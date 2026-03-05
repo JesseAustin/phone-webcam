@@ -277,16 +277,29 @@ class CameraStreamService : Service() {
         return START_STICKY
     }
 
-    fun setPreviewSurface(surface: Surface) {
+    fun setPreviewSurface(surface: Surface?) {
         previewSurface = surface
-        if (isStreaming) {
-            serviceScope.launch {
-                cameraManager?.startCapture(
-                    resolution = selectedResolution,
-                    streamSurface = h264Encoder?.inputSurface,
-                    previewSurface = previewSurface
-                )
+
+        if (!isStreaming) {
+            // Camera not open yet — just store it. startCapture() will pass it when it runs.
+            Log.i(TAG, "setPreviewSurface: not streaming yet, stored for startCapture")
+            return
+        }
+
+        if (surface != null) {
+            val hasOpenDevice = cameraManager?.isDeviceOpen() == true
+            if (hasOpenDevice) {
+                // Camera already open — hot-attach the preview surface
+                Log.i(TAG, "setPreviewSurface: camera open, attaching preview")
+                cameraManager?.attachPreviewSurface(surface)
+            } else {
+                // isStreaming=true but camera not open yet (still in startCapture coroutine).
+                // previewSurface is already stored above; startCapture will pick it up.
+                Log.i(TAG, "setPreviewSurface: streaming but camera not open yet, stored for startCapture")
             }
+        } else {
+            // UI going away — remove preview surface so the SurfaceView can be safely destroyed
+            cameraManager?.detachPreviewSurface()
         }
     }
 
@@ -350,6 +363,7 @@ class CameraStreamService : Service() {
 
     private fun createRtpSender(ip: String, port: Int): RtpSender {
         Log.d("RtpSender", "createRtpSender: password empty=${currentPassword.isEmpty()}")
+        Log.d(TAG, "createRtpSender called from: ${Thread.currentThread().stackTrace.take(6).joinToString(" <- ") { it.methodName }}")
 
         rtpSender?.reset();
 
@@ -383,7 +397,8 @@ class CameraStreamService : Service() {
                 val notif = createNotification("Connecting...")
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                     startForeground(NOTIFICATION_ID, notif,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
                 } else {
                     startForeground(NOTIFICATION_ID, notif)
                 }
@@ -443,7 +458,11 @@ class CameraStreamService : Service() {
         drainJob?.cancelAndJoin()
         drainJob = null
 
-        stopAudioStream()
+        withContext(Dispatchers.IO) {
+            audioThread?.interrupt()
+            audioThread?.join()
+            audioThread = null
+        }
 
         withContext(Dispatchers.IO) {
             cameraManager?.stopCapture()

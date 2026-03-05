@@ -335,6 +335,8 @@ static void runNetworkThread(phone_source* ctx, bool mdns_mode)
 
 	while (ctx->running && ctx->valid) {
 
+		blog(LOG_INFO, "network thread: waiting for frame, running=%d valid=%d", (int)ctx->running, (int)ctx->valid);
+
 		if (!ctx->receiver->wait_for_frame_ready(5)) {
 			noFrameMs += 5;
 			continue;

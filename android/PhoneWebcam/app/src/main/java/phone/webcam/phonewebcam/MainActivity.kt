@@ -86,7 +86,7 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun CameraPreview(
     selectedResolution: CameraManager.StreamResolution,
-    onSurfaceReady: (android.view.Surface) -> Unit
+    onSurfaceReady: (android.view.Surface?) -> Unit
 ) {
 
     val configuration = LocalConfiguration.current
@@ -111,7 +111,9 @@ fun CameraPreview(
                         onSurfaceReady(holder.surface)
                     }
                     override fun surfaceChanged(holder: android.view.SurfaceHolder, format: Int, width: Int, height: Int) {}
-                    override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {}
+                    override fun surfaceDestroyed(holder: android.view.SurfaceHolder) {
+                        onSurfaceReady(null)
+                    }
                 })
             }
         },
@@ -133,7 +135,8 @@ fun StreamScreen(viewModel: StreamViewModel) {
     val permissionsState = rememberMultiplePermissionsState(
         permissions = listOf(
             Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
+            Manifest.permission.RECORD_AUDIO,
+            Manifest.permission.POST_NOTIFICATIONS
         )
     )
 
