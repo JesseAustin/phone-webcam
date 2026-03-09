@@ -3,6 +3,9 @@ package phone.webcam.phonewebcam.network
 import android.util.Log
 
 class SrtpContext : AutoCloseable {
+
+    private var nativePtr: Long = 0
+
     companion object {
         init {
             System.loadLibrary("phonewebcam_jni")

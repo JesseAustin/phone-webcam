@@ -218,10 +218,12 @@ bool RtpReceiver::receive_frame(std::vector<uint8_t>& frame_data)
                 continue;
             }
 
+            /*
             blog(LOG_INFO, "SRTP: decrypted ok, len=%d, rtp_seq=%u, nal_byte=0x%02x",
                 received,
                 (uint16_t)((buf[2] << 8) | buf[3]),
                 received > 12 ? buf[12] : 0);
+            */
         }
         // --------------------------------
 
@@ -263,6 +265,7 @@ bool RtpReceiver::receive_frame(std::vector<uint8_t>& frame_data)
             if (fu_.active) resetFu();
             if (nal_type == 5 && !pending_params_.empty()) {
                 frame_buf_.insert(frame_buf_.end(), pending_params_.begin(), pending_params_.end());
+                pending_params_.clear();
             }
             appendAnnexB(payload, payload_len);
         }
@@ -307,13 +310,16 @@ bool RtpReceiver::receive_frame(std::vector<uint8_t>& frame_data)
             if (fu_end && fu_.active) {
                 if ((fu_.nal_header & 0x1F) == 5 && !pending_params_.empty()) {
                     frame_buf_.insert(frame_buf_.end(), pending_params_.begin(), pending_params_.end());
+                    pending_params_.clear(); 
                 }
                 appendAnnexB(fu_.payload.data(), fu_.payload.size());
                 resetFu();
             }
+            /*
             blog(LOG_INFO, "RTP: seq=%u marker=%d nal_type=%d payload_len=%d fu_start=%d fu_end=%d%s",
             seq, (int)marker, nal_type, payload_len, (int)fu_start, (int)fu_end,
             fu_end ? " [NAL complete]" : "");
+            */
         }
         
         // --- STAP-A ---

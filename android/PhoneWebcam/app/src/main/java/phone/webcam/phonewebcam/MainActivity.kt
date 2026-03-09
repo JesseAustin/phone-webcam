@@ -40,6 +40,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.ui.draw.clip
 import android.content.res.Configuration
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.material.icons.filled.FlipCameraAndroid
@@ -53,6 +54,7 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -65,6 +67,9 @@ import phone.webcam.phonewebcam.ui.Theme.PhoneWebcamTheme
 class MainActivity : ComponentActivity() {
 
     private val viewModel: StreamViewModel by viewModels()
+
+    private var savedResolutionW: Int = 1920
+    private var savedResolutionH: Int = 1080
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -81,11 +86,21 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    // Use this as a last resort if background streaming is too slow:
+    override fun onStop() {
+        super.onStop()
+        if (viewModel.uiState.value.isStreaming) {
+            viewModel.stopStreaming()
+        }
+    }
+
+
 }
 
 @Composable
 fun CameraPreview(
-    selectedResolution: CameraManager.StreamResolution,
+    //selectedResolution: CameraManager.StreamResolution,
     onSurfaceReady: (android.view.Surface?) -> Unit
 ) {
 
@@ -200,18 +215,28 @@ fun StreamScreen(viewModel: StreamViewModel) {
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                // Title
-                Text(
-                    text = "Phone Webcam",
-                    style = MaterialTheme.typography.titleLarge,
-                    modifier = Modifier.padding(bottom = 4.dp)
-                )
+                Row() {
+                    Image(
+                        painter = painterResource(id = phone.webcam.phonewebcam.R.drawable.ic_launcher_foreground),
+                        contentDescription = "Phone Webcam logo",
+                        modifier = Modifier
+                            .size(62.dp)
+                        //.align(Alignment.CenterHorizontally)
+                    )
+
+                    // Title
+                    Text(
+                        text = "Phone Webcam",
+                        style = MaterialTheme.typography.titleLarge,
+                        modifier = Modifier.align(Alignment.CenterVertically),
+                    )
+                }
 
                 Box(modifier = Modifier.fillMaxWidth())
                 {
                     // Camera Preview
                     CameraPreview(
-                        selectedResolution = uiState.selectedResolution,
+                        //selectedResolution = uiState.selectedResolution,
                         onSurfaceReady = { surface -> viewModel.setPreviewSurface(surface)
                         })
                     IconButton(
@@ -437,7 +462,7 @@ fun StreamScreen(viewModel: StreamViewModel) {
                                     onDismissRequest = { resolutionExpanded = false },
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
-                                    CameraManager.StreamResolution.entries.forEach { resolution ->
+                                    uiState.supportedResolutions.forEach { resolution ->
                                         DropdownMenuItem(
                                             text = { Text(resolution.label) },
                                             onClick = {

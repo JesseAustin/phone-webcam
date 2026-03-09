@@ -4,7 +4,7 @@
 #include <string>
 #include <obs-module.h>
 
-bool SrtpSession::start(const std::string& password) {
+bool SrtpSession::start(const std::string& password, const std::vector<uint8_t>& salt) {
     stop();
     if (password.empty()) return false;
 
@@ -18,12 +18,11 @@ bool SrtpSession::start(const std::string& password) {
         srtp_initialized = true;
     }
 
-    const char* salt = "PhoneWebcamSRTP";
+    // Use the salt passed in directly — no more SHA-256 derivation here
     if (PKCS5_PBKDF2_HMAC(password.c_str(), (int)password.length(),
-                          (const unsigned char*)salt, (int)strlen(salt),
-                          1000, EVP_sha256(), 30, master_key_) != 1) {
-        blog(LOG_ERROR, "SRTP: PBKDF2 key derivation failed");
-        return false;
+        salt.data(), (int)salt.size(), 7000, EVP_sha256(), 30, master_key_) != 1) {
+            blog(LOG_ERROR, "SRTP: PBKDF2 key derivation failed");
+            return false;
     }
 
     srtp_policy_t policy;
@@ -33,8 +32,7 @@ bool SrtpSession::start(const std::string& password) {
     policy.ssrc.type       = ssrc_any_inbound;
     policy.ssrc.value      = 0;
     policy.key             = master_key_;
-    // much more forgiving for audio
-    policy.window_size = 1024;  
+    policy.window_size     = 1024;
     policy.allow_repeat_tx = 1;
     policy.next            = nullptr;
 

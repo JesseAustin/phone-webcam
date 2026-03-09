@@ -3,6 +3,8 @@ package phone.webcam.phonewebcam.camera
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.ImageFormat
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
@@ -10,6 +12,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Log
+import android.util.Range
 import android.view.Surface
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -45,10 +48,13 @@ import kotlin.coroutines.resume
 class CameraManager(private val context: Context) {
 
     enum class StreamResolution(val label: String, val width: Int, val height: Int) {
+        RES_360P("360p", 640, 360),
         RES_480P("480p", 720, 480),
         RES_720P("720p", 1280, 720),
         RES_1080P("1080p", 1920, 1080),
-        RES_2160P("2K", 3840, 2160),
+        RES_1440P("2K", 2560, 1440),
+        RES_2160P("4K", 3840, 2160),
+        //RES_FULL_FOV("Native", 0, 0),
     }
 
     companion object {
@@ -90,6 +96,73 @@ class CameraManager(private val context: Context) {
             cameraManager.getCameraCharacteristics(id)
                 .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
         }
+
+    /**
+     * Returns a list of StreamResolutions that the current camera actually supports.
+     */
+    fun getSupportedResolutions(useFrontCamera: Boolean): List<ResolutionOption> {
+        val cameraId = (if (useFrontCamera) findFrontCamera() else findBackCamera())
+            ?: return emptyList()
+        val chars = cameraManager.getCameraCharacteristics(cameraId)
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?: return emptyList()
+        val supportedSizes = map.getOutputSizes(SurfaceTexture::class.java)
+            ?: return emptyList()
+
+        Log.d("CameraManager", "All supported sizes: ${supportedSizes.joinToString { "${it.width}x${it.height}" }}")
+
+        val standard = StreamResolution.entries
+            .filter { res ->
+                res.width == 0 || supportedSizes.any { size ->
+                    Math.abs(size.width - res.width).toFloat() / res.width < 0.15f &&
+                            Math.abs(size.height - res.height).toFloat() / res.height < 0.15f
+                }
+            }
+            .mapNotNull { res ->
+                if (res.width == 0) {
+                    ResolutionOption(res.label, 0, 0, res)
+                } else {
+                    val best = supportedSizes
+                        .filter { size ->
+                            Math.abs(size.width - res.width).toFloat() / res.width < 0.15f &&
+                                    Math.abs(size.height - res.height).toFloat() / res.height < 0.15f
+                        }
+                        .minByOrNull { size ->
+                            Math.abs(size.width - res.width) + Math.abs(size.height - res.height)
+                        } ?: return@mapNotNull null
+                    val exactMatch = best.width == res.width && best.height == res.height
+                    val label = if (exactMatch) res.label else "${res.label} (${best.width} x ${best.height})"
+                    ResolutionOption(label, best.width, best.height, res)
+                }
+            }
+        return standard
+    }
+
+    data class ResolutionOption(
+        val label: String,
+        val width: Int,
+        val height: Int,
+        val enumValue: StreamResolution? = null  // null = Full FOV entry
+    )
+
+    /*
+    fun setFrameRate(fps: Int) {
+        val session = captureSession ?: return
+        val device = cameraDevice ?: return
+        val streamSurface = activeStreamSurface ?: return
+
+        try {
+            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                addTarget(streamSurface)
+                activePreviewSurface?.let { addTarget(it) }
+                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(fps, fps))
+            }
+            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+        } catch (e: Exception) {
+            Log.e(TAG, "setFrameRate($fps) failed: ${e.message}")
+        }
+    }
+    */
 
     // -------------------------------------------------------------------------
     // Background thread
@@ -188,20 +261,35 @@ class CameraManager(private val context: Context) {
      * The encoder surface and CameraDevice are untouched.
      */
     fun detachPreviewSurface() {
-        val device = cameraDevice ?: return
-        val streamSurface = activeStreamSurface ?: return
+        val session = captureSession ?: run {
+            Log.w(TAG, "detachPreviewSurface: no session, bailing")
+            return
+        }
+        val device = cameraDevice ?: run {
+            Log.w(TAG, "detachPreviewSurface: no device, bailing")
+            return
+        }
+        val streamSurface = activeStreamSurface ?: run {
+            Log.w(TAG, "detachPreviewSurface: no stream surface, bailing")
+            return
+        }
+        val previewSurface = activePreviewSurface ?: run {
+            Log.d(TAG, "detachPreviewSurface: no preview surface, nothing to do")
+            return
+        }
 
-        Log.i(TAG, "detachPreviewSurface: reconfiguring session to encoder-only")
+        Log.i(TAG, "detachPreviewSurface: dropping preview from repeating request ONLY — no session rebuild")
         activePreviewSurface = null
         previewOutputConfig = null
 
-        when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.P -> {
-                rebuildSessionWithOutputConfigurations(device, streamSurface, previewSurface = null)
-            }
-            else -> {
-                rebuildSessionLegacy(device, listOf(streamSurface))
-            }
+        try {
+            session.stopRepeating()
+            startRepeatingRequest(session, device, listOf(streamSurface))
+            // Release the surface so the HAL stops queuing frames into the dead BufferQueue
+            previewSurface.release()
+            Log.i(TAG, "detachPreviewSurface: success")
+        } catch (e: Exception) {
+            Log.e(TAG, "detachPreviewSurface: failed — ${e.message}")
         }
     }
 
@@ -210,7 +298,8 @@ class CameraManager(private val context: Context) {
     // -------------------------------------------------------------------------
 
     suspend fun startCapture(
-        resolution: StreamResolution = StreamResolution.RES_1080P,
+        width: Int = 1920,
+        height: Int = 1080,
         streamSurface: Surface? = null,
         previewSurface: Surface? = null,
         useFrontCamera: Boolean = false,
@@ -428,6 +517,19 @@ class CameraManager(private val context: Context) {
                 }
             }
         )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val chars = cameraManager.getCameraCharacteristics(camera.id)
+            val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+            val supports4K = caps?.contains(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_CONSTRAINED_HIGH_SPEED_VIDEO
+            ) == true
+            val maxSize = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                ?.getOutputSizes(ImageFormat.JPEG)
+                ?.maxByOrNull { it.width * it.height }
+            Log.d(TAG, "Camera max size: $maxSize, supportsHighSpeed: $supports4K")
+        }
+
         camera.createCaptureSession(sessionConfig)
     }
 

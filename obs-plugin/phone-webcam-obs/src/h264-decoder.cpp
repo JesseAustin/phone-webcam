@@ -3,7 +3,7 @@
 #include <cstring>
 #include <algorithm>
 
-bool bgraToggle = true; // Set to true to enable BGRA output (for testing)
+bool bgraToggle = false; // Set to true to enable BGRA output (for testing)
 
 H264Decoder::H264Decoder()
 {
@@ -169,10 +169,12 @@ bool H264Decoder::decode(const std::vector<uint8_t>& input,
                     width / 2);
             }
 
+            /*
             blog(LOG_INFO, "I420 copy done: y_size=%zu u_size=%zu total=%zu buf_size=%zu",
             y_size, u_size, y_size + u_size * 2, output.size());
             blog(LOG_INFO, "I420 Y[0]=%02X U[0]=%02X V[0]=%02X",
             output[0], output[y_size], output[y_size + u_size]);
+            */
         }
     }
     av_frame_unref(frame_);

@@ -13,7 +13,7 @@ public:
     ~SrtpSession() {stop();}
 
     // Derive 30-byte key using PBKDF2 and initialize libsrtp
-    bool start(const std::string& password);
+    bool start(const std::string& password, const std::vector<uint8_t>& salt);
     
     //int protect(uint8_t* buf, int len);
 

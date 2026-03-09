@@ -71,6 +71,9 @@ struct phone_source {
 
 	bool mdns_mode = true;
 	std::mutex op_mutex;
+
+	std::mutex  srtp_salt_mutex;
+	std::string srtp_salt_hex;
 };
 
 extern struct obs_source_info phone_source_info;

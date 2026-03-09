@@ -9,7 +9,7 @@
 class HandshakeServer {
 public:
     // Callback fires with the connecting client's IP when Android initiates
-    using OnRequestReceived = std::function<void(const std::string& phoneIp)>;
+    using OnRequestReceived = std::function<void(const std::string& phoneIp, const std::string& saltHex)>;
 
     HandshakeServer() = default;
     ~HandshakeServer() { stop(); }

@@ -23,11 +23,13 @@ class RtpSender(
     private val ssrc = Random.nextInt()
 
     private val MAX_PAYLOAD = 1200
-    
+
+
     // SRTP Context
     private var srtpContext: SrtpContext? = null
-    
+
     init {
+        socket.sendBufferSize = 1024 * 1024 // 1MB
         if (masterKey != null && masterSalt != null) {
             srtpContext = SrtpContext().apply {
                 val res = init(masterKey, masterSalt, ssrc)
@@ -64,7 +66,7 @@ class RtpSender(
             packet[11] = (ssrc and 0xFF).toByte()
 
             System.arraycopy(payload, 0, packet, 12, payload.size)
-            
+
             sendMaybeEncrypted(packet, rtpLen)
             sequenceNumber++
         } catch (e: IOException) {
@@ -141,8 +143,13 @@ class RtpSender(
             packet[11] = (ssrc and 0xFF).toByte()
 
             System.arraycopy(nal, 0, packet, 12, nal.size)
-            
-            sendMaybeEncrypted(packet, rtpLen)
+
+            try {
+                sendMaybeEncrypted(packet, rtpLen)
+            }
+            catch (e: Exception) {
+                Log.d("RtpSender", "Send skipped: ${e.message}")
+            }
             sequenceNumber++
         } catch (e: IOException) {
             Log.d("RtpSender", "Send skipped: ${e.message}")
@@ -160,7 +167,7 @@ class RtpSender(
         while (offset < nal.size) {
             val remaining = nal.size - offset
             val chunkSize = minOf(MAX_PAYLOAD - 2, remaining)
-            
+
             // 12 (RTP) + 2 (FU) + Chunk + 10 (SRTP)
             val rtpLen = 12 + 2 + chunkSize
             val packet = ByteArray(rtpLen + 10)

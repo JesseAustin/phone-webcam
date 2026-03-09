@@ -31,7 +31,7 @@ class H264Encoder(
 
     // Called for each encoded NAL
     var onEncodedFrame: ((ByteArray, Long, Boolean) -> Unit)? = null
-
+    private var outputBuffer = ByteArray(1_000_000) // 1MB, enough for any frame
     fun start() {
         // Clear cached SPS/PPS metadata before starting a new stream
         cachedSps = null;
@@ -49,6 +49,7 @@ class H264Encoder(
             setInteger(MediaFormat.KEY_PROFILE,
                 MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
 
+            setInteger(MediaFormat.KEY_ALLOW_FRAME_DROP, 1)
             // Use variable bitrate mode
             setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR)
             // Constantly prepend SPS and PPS to each frame
@@ -81,6 +82,7 @@ class H264Encoder(
                 idx == MediaCodec.INFO_TRY_AGAIN_LATER -> return
                 idx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     val format = c.outputFormat
+
                     cachedSps = format.getByteBuffer("csd-0")?.let { ByteArray(it.remaining()).also { b -> it.get(b) } }
                     cachedPps = format.getByteBuffer("csd-1")?.let { ByteArray(it.remaining()).also { b -> it.get(b) } }
 
@@ -91,28 +93,23 @@ class H264Encoder(
                     val buf = c.getOutputBuffer(idx) ?: run { c.releaseOutputBuffer(idx, false); continue }
 
                     if (info.size > 0 && (info.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
-                        val bytes = ByteArray(info.size)
+                        if (info.size > outputBuffer.size) outputBuffer = ByteArray(info.size * 2)
                         buf.position(info.offset)
                         buf.limit(info.offset + info.size)
-                        buf.get(bytes)
+                        buf.get(outputBuffer, 0, info.size)
 
-                        // --- NAL SPLITTING LOGIC ---
                         val nals = mutableListOf<ByteArray>()
-
                         var i = 0
                         var nalStart = -1
 
-                        while (i <= bytes.size - 4) {
-                            val isFourByteStart = bytes[i] == 0.toByte() && bytes[i+1] == 0.toByte() &&
-                                    bytes[i+2] == 0.toByte() && bytes[i+3] == 1.toByte()
-
+                        while (i <= info.size - 4) {
+                            val isFourByteStart = outputBuffer[i] == 0.toByte() && outputBuffer[i+1] == 0.toByte() &&
+                                    outputBuffer[i+2] == 0.toByte() && outputBuffer[i+3] == 1.toByte()
                             val isThreeByteStart = !isFourByteStart &&
-                                    bytes[i] == 0.toByte() && bytes[i+1] == 0.toByte() && bytes[i+2] == 1.toByte()
+                                    outputBuffer[i] == 0.toByte() && outputBuffer[i+1] == 0.toByte() && outputBuffer[i+2] == 1.toByte()
 
                             if (isFourByteStart || isThreeByteStart) {
-                                if (nalStart != -1) {
-                                    nals.add(bytes.copyOfRange(nalStart, i))
-                                }
+                                if (nalStart != -1) nals.add(outputBuffer.copyOfRange(nalStart, i))
                                 nalStart = i
                                 i += if (isFourByteStart) 4 else 3
                             } else {
@@ -120,25 +117,23 @@ class H264Encoder(
                             }
                         }
 
-                        // Send the very last NAL in the buffer
-                        if (nalStart != -1) {
-                            nals.add(bytes.copyOfRange(nalStart, bytes.size))
-                        }
-                        // ---------------------------
+                        if (nalStart != -1) nals.add(outputBuffer.copyOfRange(nalStart, info.size))
 
                         val sliceIndices = nals.mapIndexedNotNull { index, nal ->
                             val type = nal.dropWhile { it == 0.toByte() }.firstOrNull()?.toInt()?.and(0x1F)
                             if (type != null && type in 1..5) index else null
                         }
-
                         val lastSliceIndex = sliceIndices.lastOrNull()
-
                         nals.forEachIndexed { index, nal ->
-                            val isLast = index == lastSliceIndex
-                            onEncodedFrame?.invoke(nal, info.presentationTimeUs, isLast)
+                            onEncodedFrame?.invoke(nal, info.presentationTimeUs, index == lastSliceIndex)
                         }
                     }
-                    c.releaseOutputBuffer(idx, false)
+                    try {
+                        c.releaseOutputBuffer(idx, false)
+                    } catch (e: IllegalStateException) {
+                        Log.w(TAG, "releaseOutputBuffer skipped — codec already stopped")
+                        return
+                    }
                 }
             }
         }

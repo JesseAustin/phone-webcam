@@ -42,6 +42,10 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private val _uiState = MutableStateFlow(StreamUiState())
     val uiState: StateFlow<StreamUiState> = _uiState.asStateFlow()
     private var handshakeJob: Job? = null
+    private var pollingJob: Job? = null
+    private var savedResolutionW: Int = 1920
+    private var savedResolutionH: Int = 1080
+    private val resolutionQueryManager = CameraManager(application)
     private var streamService: CameraStreamService? = null
     private var isBound = false
     private var _pendingPreviewSurface: Surface? = null
@@ -49,6 +53,7 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     private var streamWasStoppedByUser = true
     private var lastHandshakeIp: String? = null
     private var lastHandshakePort: Int = 9000
+    private var currentSrtpSaltHex: String = ""
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -56,10 +61,6 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
             streamService = binder.getService()
             isBound = true
 
-            // The SurfaceView's surfaceCreated fires before the service is bound, so
-            // setPreviewSurface() was a no-op. Flush the pending surface now.
-            // setPreviewSurface() calls attachPreviewSurface() if already streaming,
-            // or just stores it so startCapture() picks it up if the camera isn't open yet.
             _pendingPreviewSurface?.let { surface ->
                 streamService?.setPreviewSurface(surface)
             }
@@ -67,9 +68,24 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
             lastHandshakeIp?.let { ip ->
                 streamService?.setRtpDestination(ip, lastHandshakePort)
             }
+
             startStatusPolling()
         }
         override fun onServiceDisconnected(name: ComponentName?) {
+
+            Log.i("StreamViewModel", "onServiceDisconnected fired — isBound=$isBound userWantsToStream=$userWantsToStream")
+
+            // Stop the polling job so it doesn't keep trying to talk to a dead service
+            pollingJob?.cancel()
+            pollingJob = null
+
+            // If the service dies/stops, the UI must reflect that streaming is over
+            _uiState.update { it.copy(
+                isStreaming = false,
+                statusMessage = "Stream stopped",
+                frameCount = 0, fps = 0, bandwidth = 0.0
+            ) }
+
             streamService = null
             isBound = false
         }
@@ -79,6 +95,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         val newIsFront = !_uiState.value.isFrontCamera
         _uiState.update { it.copy(isFrontCamera = newIsFront) }
         streamService?.switchCamera(newIsFront)
+        refreshSupportedResolutions(newIsFront)
+        savePreferences()
     }
 
     fun toggleMic() {
@@ -86,6 +104,29 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(isMicEnabled = newMicEnabled) }
         streamService?.setMicEnabled(newMicEnabled)
     }
+
+    private fun refreshSupportedResolutions(useFrontCamera: Boolean) {
+        val supported = resolutionQueryManager.getSupportedResolutions(useFrontCamera)
+        val current = _uiState.value.selectedResolution
+        val validResolution = supported.firstOrNull { it.width == current.width && it.height == current.height }
+            ?: supported.firstOrNull { it.width == savedResolutionW && it.height == savedResolutionH }
+            ?: supported.firstOrNull { it.width == 1920 && it.height == 1080 }
+            ?: supported.firstOrNull()
+            ?: CameraManager.ResolutionOption("1080p", 1920, 1080, CameraManager.StreamResolution.RES_1080P)
+        _uiState.update { it.copy(supportedResolutions = supported, selectedResolution = validResolution) }
+        savePreferences()
+    }
+    /*
+    // Drop to 15fps when minimized to avoid queue backlog
+    fun minimizeStream() {
+        streamService?.dropTo15Fps()
+    }
+
+    // Return to 30fps when brought back to foreground
+    fun resumeStream() {
+        streamService?.returnTo30Fps()
+    }
+    */
 
     private val handshakeServer = HandshakeServer { ip, port ->
         Log.i(TAG, "Handshake: received from OBS — ip=$ip port=$port")
@@ -147,7 +188,6 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
     fun setPreviewSurface(surface: Surface?) {
         _pendingPreviewSurface = surface
-        // Always forward to service — it will attach or detach as appropriate
         streamService?.setPreviewSurface(surface)
     }
 
@@ -187,22 +227,20 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 val writer = socket.getOutputStream().bufferedWriter()
 
                 val currentPassword = _uiState.value.password
-                Log.d("PhoneWebcam", "onStartCommand: password empty=${currentPassword.isEmpty()}")
-
                 val ts = System.currentTimeMillis() / 1000
 
+                // Generate a fresh random salt for this session
+                val saltBytes = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
+                val saltHex = saltBytes.joinToString("") { "%02x".format(it) }
+                currentSrtpSaltHex = saltHex  // store for launchStream()
+
                 val json = if (currentPassword.isNotEmpty()) {
-                    // Generate a random 32-byte challenge and sign it with our password.
-                    // OBS receives this, recomputes the HMAC, and rejects if it does not match.
                     val challenge = ByteArray(32).also { java.security.SecureRandom().nextBytes(it) }
                     val challengeHex = challenge.joinToString("") { "%02x".format(it) }
                     val hmac = phone.webcam.phonewebcam.security.HmacAuth.computeHmac(currentPassword, challenge)
-                    Log.d(TAG, "HMAC Debug - Pass: $currentPassword, Challenge: $challengeHex, Result: $hmac")
-
-                    """{"request":"handshake","challenge":"$challengeHex","hmac":"$hmac","ts":$ts}"""
-                }
-                else {
-                    """{"request":"handshake","ts":$ts}"""
+                    """{"request":"handshake","challenge":"$challengeHex","hmac":"$hmac","ts":$ts,"salt":"$saltHex"}"""
+                } else {
+                    """{"request":"handshake","ts":$ts,"salt":"$saltHex"}"""
                 }
 
                 writer.write(json)
@@ -237,7 +275,6 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 targetPort = numericPort,
                 autoDiscoveryEnabled = false
             ) }
-            // Use the master save function to avoid key conflicts
             savePreferences()
 
             if (_uiState.value.isStreaming) {
@@ -251,37 +288,21 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         val numericPort = state.portText.toIntOrNull()
 
         if (numericPort == null || numericPort !in 1..65535) {
-            // Reset to default 9000 if invalid/blank when clicking away
             val defaultPort = 9000
             _uiState.update { it.copy(portText = defaultPort.toString(), targetPort = defaultPort) }
             savePreferences()
         }
     }
 
-    fun updateResolution(resolution: CameraManager.StreamResolution) {
+    fun updateResolution(resolution: CameraManager.ResolutionOption) {
         _uiState.update { it.copy(selectedResolution = resolution) }
         savePreferences()
     }
 
-    // -----------------------------------------------------------------------
-    // Password management
-    //
-    // Live update — same pattern as port:
-    //   updatePassword() → saves to EncryptedSharedPrefs → pushes to
-    //   handshakeServer.password so the next incoming OBS handshake uses
-    //   the new value immediately.
-    //
-    // No button, no restart required. If a stream is active when the password
-    // changes, OBS will also have restarted its stream (via its own update
-    // callback), causing a new handshake that will be validated with the new
-    // password on both ends.
-    // -----------------------------------------------------------------------
     fun updatePassword(password: String) {
         PasswordManager.setPassword(getApplication(), password)
-        handshakeServer.password = password      // @Volatile — safe cross-thread
+        handshakeServer.password = password
         _uiState.update { it.copy(password = password) }
-        // Note: we intentionally do NOT save the password in the normal
-        // stream_prefs — it lives only in EncryptedSharedPreferences.
         Log.i(TAG, "Password updated (auth: ${if (password.isEmpty()) "disabled" else "enabled"})")
     }
 
@@ -290,11 +311,8 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         serviceHasConfirmedStreaming = false
         val state = _uiState.value
         if (state.isStreaming) return
-
         if (state.targetIp.isBlank()) return
 
-        // Always initiate handshake first.
-        // Only call launchStream() inside the handshakeServer success callback.
         _uiState.update { it.copy(statusMessage = "Authenticating with OBS...") }
         initiateHandshake(state.targetIp, state.targetPort)
     }
@@ -306,8 +324,11 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
             putExtra(CameraStreamService.EXTRA_TARGET_IP, state.targetIp)
             putExtra(CameraStreamService.EXTRA_TARGET_PORT, state.targetPort)
             putExtra(CameraStreamService.EXTRA_BITRATE_MBPS, state.bitrateMbps)
-            putExtra(CameraStreamService.EXTRA_RESOLUTION, state.selectedResolution.name)
+            putExtra(CameraStreamService.EXTRA_RESOLUTION,
+                "${state.selectedResolution.width}x${state.selectedResolution.height}")
             putExtra(CameraStreamService.EXTRA_PASSWORD, state.password)
+            putExtra(CameraStreamService.EXTRA_IS_FRONT_CAMERA, state.isFrontCamera)
+            putExtra(CameraStreamService.EXTRA_SRTP_SALT, currentSrtpSaltHex)
         }
 
         if (streamService == null) {
@@ -316,27 +337,39 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
         context.bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
 
-        _uiState.value = state.copy(isStreaming = true, statusMessage = "Starting stream...")
-        Log.i(TAG, "Stream started: ${state.targetIp}:${state.targetPort}")
+        // Optimistically show starting — polling will confirm isStreaming=true
+        _uiState.value = state.copy(statusMessage = "Starting stream...")
+        Log.i(TAG, "Stream launching to: ${state.targetIp}:${state.targetPort}")
     }
 
     fun stopStreaming() {
+        // Cancel polling FIRST — prevents any further state updates from polling
+        pollingJob?.cancel()
+        pollingJob = null
+
         userWantsToStream = false
+        streamWasStoppedByUser = true
+        serviceHasConfirmedStreaming = false
 
         val context = getApplication<Application>().applicationContext
-        streamWasStoppedByUser = true
-
-        val intent = Intent(context, CameraStreamService::class.java).apply {
-            action = CameraStreamService.ACTION_STOP_STREAM
+        val service = streamService
+        if (service != null) {
+            service.stopStreaming()
+        } else {
+            val intent = Intent(context, CameraStreamService::class.java).apply {
+                action = CameraStreamService.ACTION_STOP_STREAM
+            }
+            context.startService(intent)
         }
-        context.startService(intent)
 
+        Log.i(TAG, "stopStreaming: isBound=$isBound streamService=${streamService != null}")
         if (isBound) {
             context.unbindService(serviceConnection)
             isBound = false
         }
 
         streamService = null
+
         _uiState.value = _uiState.value.copy(
             isStreaming = false,
             statusMessage = "Stream stopped",
@@ -345,35 +378,44 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     }
 
     private fun startStatusPolling() {
-        viewModelScope.launch {
-            while (isActive && isBound) {
+        pollingJob?.cancel()
+        pollingJob = viewModelScope.launch {
+            while (isActive) {
                 val service = streamService
-                if (service != null) {
-                    val status = service.getStreamingStatus()
-                    val bandwidthMbps = if (status.elapsedSeconds > 0)
-                        (status.bytesSent * 8.0 / 1_000_000) / status.elapsedSeconds else 0.0
+                if (service == null || !isBound) break
 
-                    _uiState.update { current ->
-                        if (status.isStreaming) serviceHasConfirmedStreaming = true
+                val status = service.getStreamingStatus()
+                val bandwidthMbps = if (status.elapsedSeconds > 0)
+                    (status.bytesSent * 8.0 / 1_000_000) / status.elapsedSeconds else 0.0
 
-                        val isUnexpectedStop = serviceHasConfirmedStreaming &&
-                                current.isStreaming && !status.isStreaming
+                var wasUnexpectedStop = false
 
-                        if (isUnexpectedStop) {
-                            serviceHasConfirmedStreaming = false
-                            networkDiscovery.restartAdvertising(_uiState.value.targetPort)
-                            current.copy(isStreaming = false, statusMessage = "Reconnecting...")
-                        } else {
-                            current.copy(
-                                frameCount = status.frameCount,
-                                fps = status.fps.toInt(),
-                                bandwidth = bandwidthMbps,
-                                statusMessage = if (current.isStreaming)
-                                    "Streaming to ${status.targetInfo}" else current.statusMessage
-                            )
-                        }
+                _uiState.update { current ->
+                    if (status.isStreaming) serviceHasConfirmedStreaming = true
+
+                    val isUnexpectedStop = serviceHasConfirmedStreaming &&
+                            current.isStreaming && !status.isStreaming
+
+                    if (isUnexpectedStop) {
+                        serviceHasConfirmedStreaming = false
+                        wasUnexpectedStop = true
+                        current.copy(isStreaming = false, statusMessage = "Stream stopped")
+                    } else {
+                        current.copy(
+                            isStreaming = if (status.isStreaming) true else current.isStreaming,
+                            frameCount = status.frameCount,
+                            fps = status.fps.toInt(),
+                            bandwidth = bandwidthMbps,
+                            statusMessage = if (status.isStreaming)
+                                "Streaming to ${status.targetInfo}" else current.statusMessage
+                        )
                     }
                 }
+
+                if (wasUnexpectedStop) {
+                    stopStreaming()
+                }
+
                 delay(100)
             }
         }
@@ -395,28 +437,39 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
         val port = prefs.getInt("target_port", 9000)
 
-        val resolutionName = prefs.getString("resolution", "RES_1080P") ?: "RES_1080P"
-        val resolution = try {
-            CameraManager.StreamResolution.valueOf(resolutionName)
-        } catch (e: IllegalArgumentException) {
-            CameraManager.StreamResolution.RES_1080P
-        }
-
-        // Load password from encrypted prefs (never from stream_prefs)
         val savedPassword = PasswordManager.getPassword(context)
-        handshakeServer.password = savedPassword  // apply on restore
+        handshakeServer.password = savedPassword
 
         val autoDiscovery = prefs.getBoolean("auto_discovery", true)
+        val isFront = prefs.getBoolean("is_front_camera", false)
+
+        //val isFront = prefs.getBoolean("is_front_camera", false)
+        //val supported = resolutionQueryManager.getSupportedResolutions(isFront)
+        //val validResolution = if (resolution in supported) resolution
+        //else supported.lastOrNull() ?: CameraManager.StreamResolution.RES_1080P
+
+        // match saved WxH against supported list after refresh:
+        val resString = prefs.getString("resolution", "1920x1080") ?: "1920x1080"
+        val parts = resString.split("x")
+        val savedW = parts.getOrNull(0)?.toIntOrNull() ?: 1920
+        val savedH = parts.getOrNull(1)?.toIntOrNull() ?: 1080
+        // Store for matching after refreshSupportedResolutions() runs:
+        savedResolutionW = savedW
+        savedResolutionH = savedH
+
+
+
         _uiState.update { it.copy(
             targetIp             = prefs.getString("target_ip", DEFAULT_IP) ?: DEFAULT_IP,
             targetPort           = prefs.getInt("target_port", DEFAULT_PORT),
             portText             = port.toString(),
-            selectedResolution   = resolution,
             bitrateMbps          = prefs.getInt("bitrate_mbps", 20),
             autoDiscoveryEnabled = autoDiscovery,
-            password = savedPassword,
+            password             = savedPassword,
+            isFrontCamera        = isFront,
         ) }
 
+        refreshSupportedResolutions(isFront)  // ← sets selectedResolution from savedResolutionW/H
     }
 
     private fun savePreferences() {
@@ -426,11 +479,11 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
 
         prefs.edit().apply {
             putString("target_ip", state.targetIp)
-            putString("resolution", state.selectedResolution.name)
+            putString("resolution", "${state.selectedResolution.width}x${state.selectedResolution.height}")
             putInt("target_port", state.targetPort)
             putInt("bitrate_mbps", state.bitrateMbps)
             putBoolean("auto_discovery", state.autoDiscoveryEnabled)
-            // password intentionally excluded — stored in EncryptedSharedPreferences only
+            putBoolean("is_front_camera", state.isFrontCamera)
             apply()
         }
     }
@@ -438,8 +491,6 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
     override fun onCleared() {
         handshakeServer.stop()
         networkDiscovery.stopAdvertising()
-        //stopStreaming()
-        //streamService?.setPreviewSurface(null)
         super.onCleared()
     }
 }
@@ -449,7 +500,9 @@ data class StreamUiState(
     val targetIp: String = "192.168.1.100",
     val targetPort: Int = 9000,
     val portText: String = "9000",
-    val selectedResolution: CameraManager.StreamResolution = CameraManager.StreamResolution.RES_1080P,
+    val selectedResolution: CameraManager.ResolutionOption = CameraManager.ResolutionOption
+        ("1080p", 1920, 1080, CameraManager.StreamResolution.RES_1080P),
+    val supportedResolutions: List<CameraManager.ResolutionOption> = emptyList(),
     val frameCount: Long = 0,
     val fps: Int = 0,
     val bandwidth: Double = 0.0,
@@ -458,7 +511,5 @@ data class StreamUiState(
     val autoDiscoveryEnabled: Boolean = true,
     val isFrontCamera: Boolean = false,
     val isMicEnabled: Boolean = true,
-    // Password is in state so the UI field can be bound to it,
-    // but it is persisted separately in EncryptedSharedPreferences.
     val password: String = ""
 )

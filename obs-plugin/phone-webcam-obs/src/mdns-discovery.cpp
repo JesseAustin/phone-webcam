@@ -210,7 +210,8 @@ void MdnsDiscovery::discoveryLoop()
         if (received <= 0) continue;
 
         // If discovery has been paused, ignore incoming responses entirely.
-        if (paused_.load()) continue;
+        // Actually nevermind, we wanna make mDNS discovery available unconditionally:
+        //if (paused_.load()) continue;
 
         char senderIp[INET_ADDRSTRLEN] = {};
         inet_ntop(AF_INET, &sender.sin_addr, senderIp, sizeof(senderIp));
@@ -237,8 +238,10 @@ void MdnsDiscovery::discoveryLoop()
         uint16_t port = 0;
         std::string targetHost;
         bool handledByARecord = false;
+        bool srvIsPhoneWebcam = false;
 
         for (int rr = 0; rr < totalRR && offset < (size_t)received; rr++) {
+
             std::string rrName = readDnsName(buf, received, offset);
             if (offset + 10 > (size_t)received) break;
 
@@ -260,7 +263,10 @@ void MdnsDiscovery::discoveryLoop()
                 blog(LOG_INFO, "mDNS PTR -> %s", target.c_str());
                 
                 // Send immediate follow-up SRV query for this instance
-                if (!target.empty()) {
+
+                // "&& rrName == SERVICE_TYPE" stops mDNS communications 
+                // with random devices from interrupting the user's stream!
+                if (!target.empty() && rrName == SERVICE_TYPE) {
                     std::vector<uint8_t> srvQuery;
                     srvQuery.push_back(0x00); srvQuery.push_back(0x00); // ID
                     srvQuery.push_back(0x00); srvQuery.push_back(0x00); // flags: standard query
@@ -283,12 +289,15 @@ void MdnsDiscovery::discoveryLoop()
                     size_t nameOffset = offset + 6;
                     targetHost = readDnsName(buf, received, nameOffset);
                     blog(LOG_INFO, "mDNS SRV -> host=%s port=%d", targetHost.c_str(), port);
+
+                    // Only trust this SRV if it's under our service type
+                    srvIsPhoneWebcam = (rrName.find("_phonewebcam._udp.local") != std::string::npos);
                 }
             }
             
 
             else if (rrType == 1) { // A record
-                if (rdLen == 4) {
+                if (rdLen == 4 && rrName == targetHost && srvIsPhoneWebcam) {
                     char ipstr[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, buf + offset, ipstr, sizeof(ipstr));
                     if (port > 0 && callback_) {
@@ -306,7 +315,7 @@ void MdnsDiscovery::discoveryLoop()
         }
 
         // If we got a valid streaming port from SRV, check if it's a new service
-        if (port > 0 && !handledByARecord) {
+        if (port > 0 && !handledByARecord && srvIsPhoneWebcam) {
             auto now = std::chrono::steady_clock::now();
             constexpr auto DEBOUNCE_MS = 2000;
 
@@ -317,7 +326,7 @@ void MdnsDiscovery::discoveryLoop()
                 // This lets a re-advertise from Android (after stream drop) re-link OBS
                 auto stale = std::chrono::duration_cast<std::chrono::seconds>(
                     now - last_service_time_).count();
-                if (stale < 6) continue;  // suppress duplicate within 1s window
+                if (stale < 6) continue;  // suppress duplicate within a short window
                 // else: fall through and re-fire callback (phone re-advertised)
             }
 

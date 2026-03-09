@@ -13,6 +13,8 @@ import android.media.MediaFormat
 import android.media.MediaRecorder
 import android.os.Binder
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
 import android.view.Surface
@@ -27,6 +29,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.concurrent.atomic.AtomicLong
+
 
 class CameraStreamService : Service() {
 
@@ -44,20 +47,20 @@ class CameraStreamService : Service() {
         const val EXTRA_RESOLUTION    = "resolution"
         const val EXTRA_BITRATE_MBPS  = "extra_bitrate_mbps"
         const val EXTRA_PASSWORD      = "extra_password"
-
-        // Static salt for SRTP key derivation.
-        // Must match what the OBS plugin uses.
-        private val SRTP_SALT = "PhoneWebcamSRTP".toByteArray()
+        const val EXTRA_IS_FRONT_CAMERA = "extra_is_front_camera"
+        const val EXTRA_SRTP_SALT = "extra_srtp_salt"
     }
 
+    private var lastFrameSentMs = 0L
     private val binder = LocalBinder()
     private var cameraManager: CameraManager? = null
+
     private var rtpSender: RtpSender? = null
     private var audioSender: RtpSender? = null
     private var h264Encoder: H264Encoder? = null
     private var drainJob: Job? = null
-
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private var drainThread: Thread? = null
+    private var serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     @Volatile private var isStreaming = false
     @Volatile private var previewSurface: Surface? = null
@@ -66,9 +69,11 @@ class CameraStreamService : Service() {
     private val frameCount = AtomicLong(0)
     private val bytesSent  = AtomicLong(0)
     private var startTime  = 0L
-    private var selectedResolution = CameraManager.StreamResolution.RES_1080P
+    private var selectedWidth: Int = 1920
+    private var selectedHeight: Int = 1080
     private var bitrateMbps: Int = 20
     private var currentPassword: String = ""
+    private var currentSrtpSalt: ByteArray? = null
 
     @Volatile private var audioRecord: AudioRecord? = null
     @Volatile private var audioCodec: MediaCodec? = null
@@ -195,6 +200,19 @@ class CameraStreamService : Service() {
         }.also { it.start() }
     }
 
+    /*
+    fun dropTo15Fps() {
+        // Android will throttle camera to ~15fps in background anyway.
+        // Explicitly request 15fps so the encoder doesn't build a backlog.
+        cameraManager?.setFrameRate(15)
+    }
+
+    fun returnTo30Fps() {
+        cameraManager?.setFrameRate(30)
+        requestKeyFrame()
+    }
+    */
+
     fun stopAudioStream() {
         audioThread?.interrupt()
         audioThread?.join()
@@ -252,6 +270,12 @@ class CameraStreamService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+
+        // Ensure scope is alive if service is restarted
+        if (!serviceScope.isActive) {
+            serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+        }
+
         createNotificationChannel()
         cameraManager = CameraManager(this)
     }
@@ -259,22 +283,34 @@ class CameraStreamService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_START_STREAM -> {
+                Log.i(TAG, "ACTION_START_STREAM received — isStreaming=$isStreaming")
+
                 val ip   = intent.getStringExtra(EXTRA_TARGET_IP) ?: "192.168.1.100"
                 val port = intent.getIntExtra(EXTRA_TARGET_PORT, 9000)
-                val resName = intent.getStringExtra(EXTRA_RESOLUTION) ?: "RES_1080P"
+                val resString = intent.getStringExtra(EXTRA_RESOLUTION) ?: "1920x1080"
+
                 bitrateMbps = intent.getIntExtra(EXTRA_BITRATE_MBPS, 20)
                 currentPassword = intent.getStringExtra(EXTRA_PASSWORD) ?: ""
 
-                val resolution = try {
-                    CameraManager.StreamResolution.valueOf(resName)
-                } catch (e: IllegalArgumentException) {
-                    CameraManager.StreamResolution.RES_1080P
-                }
-                startStreaming(ip, port, resolution)
+                // Decode the hex salt back to bytes
+                val saltHex = intent.getStringExtra(EXTRA_SRTP_SALT) ?: ""
+                currentSrtpSalt = if (saltHex.isNotEmpty()) {
+                    saltHex.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+                } else null
+
+                val parts = resString.split("x")
+                val resW = parts.getOrNull(0)?.toIntOrNull() ?: 1920
+                val resH = parts.getOrNull(1)?.toIntOrNull() ?: 1080
+
+                val isFrontCamera = intent.getBooleanExtra(EXTRA_IS_FRONT_CAMERA, false)
+                startStreaming(ip, port, resW, resH, isFrontCamera)
             }
-            ACTION_STOP_STREAM -> stopStreaming()
+            ACTION_STOP_STREAM -> {
+                Log.i(TAG, "Stop requested via Intent (Notification)")
+                stopStreaming()
+            }
         }
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     fun setPreviewSurface(surface: Surface?) {
@@ -303,17 +339,40 @@ class CameraStreamService : Service() {
         }
     }
 
-    fun switchCamera(useFront: Boolean) {
-        if (!isStreaming) return
+    fun switchCamera(useFront: Boolean, onComplete: ((Boolean) -> Unit)? = null) {
+        if (!isStreaming) { onComplete?.invoke(false); return }
+
+        val encoderSurface = h264Encoder?.inputSurface
+        if (encoderSurface == null) { onComplete?.invoke(false); return }
+
         serviceScope.launch {
-            cameraManager?.stopCapture()
-            cameraManager?.startCapture(
-                resolution = selectedResolution,
-                streamSurface = h264Encoder?.inputSurface,
-                previewSurface = previewSurface,
-                useFrontCamera = useFront
-            )
-            h264Encoder?.requestKeyFrame()
+            try {
+                cameraManager?.stopCapture()
+                delay(300) // let camera session fully close
+                cameraManager?.startCapture(
+                    width = selectedWidth,
+                    height = selectedHeight,
+                    streamSurface = encoderSurface,
+                    previewSurface = previewSurface,
+                    useFrontCamera = useFront
+                )
+                delay(100) // let first frames through before keyframe
+                requestKeyFrame()
+            } catch (e: Exception) {
+                Log.e(TAG, "Camera switch failed: ${e.message}")
+                // Try to recover by restarting with back camera
+                try {
+                    cameraManager?.startCapture(
+                        width = selectedWidth,
+                        height = selectedHeight,
+                        streamSurface = h264Encoder?.inputSurface,
+                        previewSurface = previewSurface,
+                        useFrontCamera = false
+                    )
+                } catch (e2: Exception) {
+                    Log.e(TAG, "Camera recovery failed: ${e2.message}")
+                }
+            }
         }
     }
 
@@ -328,13 +387,15 @@ class CameraStreamService : Service() {
             audioSender?.close()
             audioSender = createRtpSender(ip, port + 1)
         }
-        h264Encoder?.requestKeyFrame()
+        requestKeyFrame()
     }
 
     fun redirectStream(newIp: String, newPort: Int) {
         if (!isStreaming) return
 
         serviceScope.launch {
+            // give OBS time to finish SRTP session init
+            delay(370)
             val oldSender: RtpSender?
             val oldAudioSender: RtpSender?
             synchronized(senderLock) {
@@ -356,7 +417,7 @@ class CameraStreamService : Service() {
                     extractNalsFromAnnexB(pps).forEach { sender.sendNal(it, 0, true) }
                 }
             }
-            h264Encoder?.requestKeyFrame()
+            requestKeyFrame()
             updateNotification("Streaming to $newIp:$newPort")
         }
     }
@@ -365,11 +426,15 @@ class CameraStreamService : Service() {
         Log.d("RtpSender", "createRtpSender: password empty=${currentPassword.isEmpty()}")
         Log.d(TAG, "createRtpSender called from: ${Thread.currentThread().stackTrace.take(6).joinToString(" <- ") { it.methodName }}")
 
-        rtpSender?.reset();
+        rtpSender?.reset()
 
         return if (currentPassword.isNotEmpty()) {
-            val (key, salt) = SrtpKeyDerivation.deriveKeys(currentPassword, SRTP_SALT)
-            RtpSender(ip, port, key, salt)
+            val salt = currentSrtpSalt ?: java.security.MessageDigest.getInstance("SHA-256")
+                .digest(currentPassword.toByteArray())
+                .take(16)
+                .toByteArray()  // fallback if no salt received
+            val (key, rtpSalt) = SrtpKeyDerivation.deriveKeys(currentPassword, salt)
+            RtpSender(ip, port, key, rtpSalt)
         } else {
             RtpSender(ip, port)
         }
@@ -378,7 +443,9 @@ class CameraStreamService : Service() {
     fun startStreaming(
         targetIp: String,
         targetPort: Int,
-        resolution: CameraManager.StreamResolution
+        resolutionWidth: Int,
+        resolutionHeight: Int,
+        useFrontCamera: Boolean = false,
     ) {
         frameCount.set(0)
         bytesSent.set(0)
@@ -386,7 +453,11 @@ class CameraStreamService : Service() {
 
         serviceScope.launch {
             try {
-                selectedResolution = resolution
+                selectedWidth = resolutionWidth
+                selectedHeight = resolutionHeight
+
+                // Set thread priority:
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_VIDEO)
 
                 if (isStreaming) {
                     teardown()
@@ -409,83 +480,194 @@ class CameraStreamService : Service() {
                 }
 
                 h264Encoder = H264Encoder(
-                    selectedResolution.width,
-                    selectedResolution.height,
+                    selectedWidth,
+                    selectedHeight,
                     bitrateMbps * 1_000_000
                 ).also { encoder ->
+
+                    var lastPts = 0L
+                    var firstFrameWallNs = 0L
+                    var firstFramePts = 0L
+
                     encoder.onEncodedFrame = { nal, pts, isLast ->
+
                         bytesSent.addAndGet(nal.size.toLong())
                         if (isLast) frameCount.incrementAndGet()
 
-                        if (isLast) Log.d(TAG, "NAL_SEND pts=$pts wall=${System.currentTimeMillis()}")
+                        if (isLast) {
+                            val ptsDelta = pts - lastPts
+                            if (lastPts != 0L && (ptsDelta !in 20_000..60_000)) {
+                                Log.w(TAG, "PTS_ANOMALY: delta=${ptsDelta}us (expected ~33333us)")
+                            }
+                            lastPts = pts
 
-                        val rtpTimestamp = (pts / 1000).toInt()
-                        synchronized(senderLock) {
-                            rtpSender?.sendNal(nal, rtpTimestamp, isLast)
+                            val now = System.currentTimeMillis()
+                            val interval = now - lastFrameSentMs
+                            lastFrameSentMs = now
+                            if (interval > 50) {
+                                Log.w(TAG, "FRAME_GAP: ${interval}ms between frames")
+                            }
                         }
+
+                        val wallNow = System.nanoTime()
+                        if (firstFrameWallNs == 0L) {
+                            firstFrameWallNs = wallNow
+                            firstFramePts = pts
+                        } else {
+                            val ptsDrift = ((wallNow - firstFrameWallNs) / 1000L) - (pts - firstFramePts)
+                            if (pts < firstFramePts || ptsDrift > 1_500_000L || ptsDrift < -500_000L) {
+                                Log.w(TAG, "PTS_REANCHOR: drift=${ptsDrift}us")
+                                firstFrameWallNs = wallNow
+                                firstFramePts = pts
+                            }
+                        }
+
+                        val wallPts = firstFramePts + (wallNow - firstFrameWallNs) / 1000L
+                        val wallNowUs = wallNow / 1000L
+
+                        // Drop frames more than 200ms behind wall clock
+                        val wallElapsedUs = (wallNow - firstFrameWallNs) / 1000L
+                        val ptsElapsedUs = pts - firstFramePts
+                        val staleness = wallElapsedUs - ptsElapsedUs
+
+                        if (staleness <= 200_000L) {
+                            val rtpTimestamp = (wallPts * 90L / 1000L).toInt()
+                            synchronized(senderLock) {
+                                rtpSender?.sendNal(nal, rtpTimestamp, isLast)
+                            }
+                        }
+
                     }
                     encoder.start()
                     encoder.requestKeyFrame()
                 }
 
                 isStreaming = true
-                updateNotification("Streaming to $targetIp:$targetPort")
 
-                drainJob = serviceScope.launch(Dispatchers.Default) {
-                    while (isActive && isStreaming) {
-                        h264Encoder?.drainOutput()
-                        yield()
+                // STOP using serviceScope.launch(Dispatchers.Default) for the drain loop
+                drainThread = Thread({
+                    android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_VIDEO)
+                    try {
+                        while (isStreaming && !Thread.currentThread().isInterrupted) {
+                            val encoder = h264Encoder
+                            if (encoder != null) {
+                                encoder.drainOutput()
+                                // A very short sleep provides backpressure without high CPU usage
+                                Thread.sleep(1)
+                            } else {
+                                Thread.sleep(10)
+                            }
+                        }
+                    } catch (e: InterruptedException) {
+                        // Normal exit on stop
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Drain thread error", e)
                     }
+                }, "EncoderDrainThread").apply {
+                    isDaemon = true
+                    start()
                 }
 
+                updateNotification("Streaming to $targetIp:$targetPort")
+
                 cameraManager?.startCapture(
-                    resolution,
+                    width = selectedWidth,
+                    height = selectedHeight,
                     h264Encoder?.inputSurface,
-                    previewSurface
+                    previewSurface,
+                    useFrontCamera = useFrontCamera
                 )
 
                 startAudioStream(targetIp, targetPort + 1)
 
             } catch (e: Exception) {
                 Log.e(TAG, "Pipeline error", e)
+                //isStreaming = true  // force teardown to actually run
                 stopStreaming()
             }
         }
     }
 
+    @Volatile private var isTearingDown = false
+
     private suspend fun teardown() {
-        isStreaming = false
-        drainJob?.cancelAndJoin()
-        drainJob = null
-
-        withContext(Dispatchers.IO) {
-            audioThread?.interrupt()
-            audioThread?.join()
-            audioThread = null
+        // 1. Interrupt an stop the drain loop immediately
+        drainThread?.let { thread ->
+            thread.interrupt()
+            // withContext returns 'R'. By naming the parameter 'thread',
+            // we help the compiler realize this block returns Unit.
+            withContext(Dispatchers.IO) {
+                try {
+                    thread.join(500)
+                } catch (e: Exception) {
+                    Log.e(TAG, "Join interrupted: ${e.message}")
+                }
+            }
         }
+        drainThread = null
 
-        withContext(Dispatchers.IO) {
-            cameraManager?.stopCapture()
+        // Collapse concurrent teardown calls — only one runs at a time
+        if (isTearingDown) {
+            Log.w(TAG, "teardown: already in progress, skipping")
+            return
         }
+        isTearingDown = true
 
-        h264Encoder?.stop()
-        h264Encoder = null
+        try {
+            // Already done earlier in "stopStreaming()"
+            // so we no longer need it here:
+            //isStreaming = false
 
-        synchronized(senderLock) {
-            rtpSender?.close()
-            rtpSender = null
-            audioSender?.close()
-            audioSender = null
+            // Stop audio first (fast — just interrupts a thread)
+            withContext(Dispatchers.IO) {
+                stopAudioStream()
+            }
+
+            // Stop camera (async close — must complete before encoder stop)
+            withContext(Dispatchers.IO) {
+                cameraManager?.stopCapture()
+            }
+
+            // Stop encoder only after camera is closed so the input surface
+            // is no longer being written to
+            h264Encoder?.stop()
+            h264Encoder = null
+
+            synchronized(senderLock) {
+                rtpSender?.close()
+                rtpSender = null
+                audioSender?.close()
+                audioSender = null
+            }
+
+            cameraManager?.stopBackgroundThread()
+            previewSurface = null
+
+        } finally {
+            isTearingDown = false
         }
-        cameraManager?.stopBackgroundThread()
     }
 
     fun stopStreaming() {
+        // Guard against concurrent/double stop calls
+        if (!isStreaming) {
+            Log.i(TAG, "stopStreaming: already stopped, ignoring")
+            stopForeground(STOP_FOREGROUND_REMOVE)
+
+            // Don't stopSelf() here — let the caller decide lifecycle
+            stopSelf()
+            return
+        }
+
+        isStreaming = false  // ← set synchronously so double-press guard works immediately
+
         serviceScope.launch {
             teardown()
-            updateNotification("Stream stopped")
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
+            // stopForeground/stopSelf are Service methods — must run on main thread
+            withContext(Dispatchers.Main) {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
         }
     }
 
@@ -517,6 +699,8 @@ class CameraStreamService : Service() {
                 nals.add(buffer.copyOfRange(nalDataStart, endIndex))
         }
 
+        Log.i(TAG, "Nals size: ${nals.size}")
+
         return nals
     }
 
@@ -543,7 +727,7 @@ class CameraStreamService : Service() {
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(CHANNEL_ID, CHANNEL_NAME,
-                NotificationManager.IMPORTANCE_LOW).apply {
+                NotificationManager.IMPORTANCE_DEFAULT).apply {
                 description = "Camera streaming"
                 setShowBadge(false)
             }
@@ -553,8 +737,12 @@ class CameraStreamService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
-        serviceScope.launch { teardown() }.invokeOnCompletion {
-            serviceScope.cancel()
+
+        val scope = serviceScope
+        serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default) // fresh scope for any restart
+
+        scope.launch { teardown() }.invokeOnCompletion {
+            scope.cancel()
         }
     }
 

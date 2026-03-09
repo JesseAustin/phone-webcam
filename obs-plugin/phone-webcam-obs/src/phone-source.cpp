@@ -42,6 +42,13 @@ const char *phone_source_get_name(void * /*unused*/)
 	return "Phone Webcam";
 }
 
+static std::vector<uint8_t> decodeSaltHex(const std::string& hex) {
+    std::vector<uint8_t> bytes;
+    for (size_t i = 0; i + 1 < hex.size(); i += 2)
+        bytes.push_back((uint8_t)std::stoi(hex.substr(i, 2), nullptr, 16));
+    return bytes;
+}
+
 // set to true to test
 const bool DEBUG_SKIP_SRTP = false; // set to true to test
 
@@ -104,12 +111,17 @@ static void launchReconnectThread(phone_source* ctx)
 				ctx->video_srtp.stop();
 
 				// Start SRTP sessions if password is non-empty
-				if (!pw.empty()) {
-					ctx->audio_srtp.start(pw);
-					ctx->video_srtp.start(pw);
-
+				std::vector<uint8_t> srtp_salt;
+				{
+					std::lock_guard<std::mutex> lock(ctx->srtp_salt_mutex);
+					srtp_salt = decodeSaltHex(ctx->srtp_salt_hex);
+				}
+				if (!srtp_salt.empty() && !pw.empty()) {
+					ctx->audio_srtp.start(pw, srtp_salt);
+					ctx->video_srtp.start(pw, srtp_salt);
 					ctx->receiver->set_srtp_session(&ctx->video_srtp);
 				} else {
+					blog(LOG_WARNING, "phone-source: no SRTP salt available or no password, skipping SRTP");
 					ctx->receiver->set_srtp_session(nullptr);
 				}
 
@@ -138,12 +150,17 @@ static void launchReconnectThread(phone_source* ctx)
 			ctx->video_srtp.stop();
 
 			// Start SRTP sessions if password is non-empty
-			if (!pw.empty()) {
-				ctx->audio_srtp.start(pw);
-				ctx->video_srtp.start(pw);
-
+			std::vector<uint8_t> srtp_salt;
+			{
+				std::lock_guard<std::mutex> lock(ctx->srtp_salt_mutex);
+				srtp_salt = decodeSaltHex(ctx->srtp_salt_hex);
+			}
+			if (!srtp_salt.empty() && !pw.empty()) {
+				ctx->audio_srtp.start(pw, srtp_salt);
+				ctx->video_srtp.start(pw, srtp_salt);
 				ctx->receiver->set_srtp_session(&ctx->video_srtp);
 			} else {
+				blog(LOG_WARNING, "phone-source: no SRTP salt available or no password, skipping SRTP");
 				ctx->receiver->set_srtp_session(nullptr);
 			}
 
@@ -230,7 +247,7 @@ static void runAudioThread(phone_source* ctx)
 							(sockaddr*)&sender,
 							&sender_len);
 
-			blog(LOG_INFO, "audio: recvfrom returned %d", len);
+			//blog(LOG_INFO, "audio: recvfrom returned %d", len);
 
 			if (len <= 0)
 				continue;
@@ -335,7 +352,7 @@ static void runNetworkThread(phone_source* ctx, bool mdns_mode)
 
 	while (ctx->running && ctx->valid) {
 
-		blog(LOG_INFO, "network thread: waiting for frame, running=%d valid=%d", (int)ctx->running, (int)ctx->valid);
+		//blog(LOG_INFO, "network thread: waiting for frame, running=%d valid=%d", (int)ctx->running, (int)ctx->valid);
 
 		if (!ctx->receiver->wait_for_frame_ready(5)) {
 			noFrameMs += 5;
@@ -350,7 +367,7 @@ static void runNetworkThread(phone_source* ctx, bool mdns_mode)
 
 		bool have_latest = false;
 		if (have_undecoded_frame) {
-			blog(LOG_INFO, "phone-source: detected H.264 frame");
+			//blog(LOG_INFO, "phone-source: detected H.264 frame");
 
 			if (decoder_needs_flush && encoded_data.size() >= 5) {
 				uint8_t nal_byte = encoded_data[4];
@@ -420,9 +437,17 @@ static void runNetworkThread(phone_source* ctx, bool mdns_mode)
 				frame.linesize[1] = latest_width / 2;
 				frame.data[2]     = ctx->back_buffer.data() + y_size + u_size;
 				frame.linesize[2] = latest_width / 2;
+
+				// Declare a partial range/color matrix CS 709:
+				float matrix[16];
+				video_format_get_parameters(VIDEO_CS_709, VIDEO_RANGE_PARTIAL,
+					matrix, frame.color_range_min, frame.color_range_max);
+					memcpy(frame.color_matrix, matrix, sizeof(matrix));
+					frame.full_range = false;
 			}
 
-			blog(LOG_INFO, "NAL_RECV wall=%lld", (long long)os_gettime_ns() / 1000000);
+			//blog(LOG_INFO, "NAL_RECV wall=%lld", (long long)os_gettime_ns() / 1000000);
+			
 			obs_source_output_video(ctx->source, &frame);
 		}
 	}
@@ -465,12 +490,12 @@ void *phone_source_create(obs_data_t *settings, obs_source_t *source)
 	}
 	
 	// Start the SRTP session for the audio if password is there
-	if (!ctx->password.empty()) {
+	/*if (!ctx->password.empty()) {
     	ctx->audio_srtp.start(ctx->password);
     	ctx->video_srtp.start(ctx->password);
 
 		ctx->receiver->set_srtp_session(&ctx->video_srtp);
-	}
+	}*/
 
 	pw = ctx->password;
 	
@@ -486,6 +511,18 @@ void *phone_source_create(obs_data_t *settings, obs_source_t *source)
 
 		if (ctx->running && ctx->port.load() == port) {
 			blog(LOG_INFO, "mDNS: re-discovered same service, requesting keyframe");
+
+			// Send handshake so Android gets our IP and fills in its text field
+			std::string pw;
+			{
+				std::lock_guard<std::mutex> lock(ctx->password_mutex);
+				pw = ctx->password;
+			}
+			std::string ip_copy = ip;
+			uint16_t port_copy = port;
+			std::thread([ctx, ip_copy, port_copy, pw]() {
+				HandshakeClient::sendHandshake(ip_copy, port_copy, pw);
+			}).detach();
 			return;
 		}
 
@@ -560,10 +597,17 @@ void *phone_source_create(obs_data_t *settings, obs_source_t *source)
 	}
 
 	// Handshake server callback (Android→OBS direction)
-	ctx->handshakeServer->start([ctx, pw](const std::string& phoneIp) {
+	ctx->handshakeServer->start([ctx](const std::string& phoneIp, const std::string& saltHex) {
 		if (!ctx || !ctx->valid) return;
 
 		blog(LOG_INFO, "HandshakeServer: Android requested handshake from %s", phoneIp.c_str());
+
+		// Store the salt before starting SRTP
+		{
+			std::lock_guard<std::mutex> lock(ctx->srtp_salt_mutex);
+			ctx->srtp_salt_hex = saltHex;
+		}
+
 
 		uint16_t port = ctx->port.load();
 		if (port == 0) port = 9000;
@@ -583,12 +627,17 @@ void *phone_source_create(obs_data_t *settings, obs_source_t *source)
 		ctx->video_srtp.stop();
 
 		// Start SRTP sessions if password is non-empty
-		if (!pw.empty()) {
-			ctx->audio_srtp.start(pw);
-			ctx->video_srtp.start(pw);
-
+		std::vector<uint8_t> srtp_salt;
+		{
+			std::lock_guard<std::mutex> lock(ctx->srtp_salt_mutex);
+			srtp_salt = decodeSaltHex(ctx->srtp_salt_hex);
+		}
+		if (!srtp_salt.empty() && !pw.empty()) {
+			ctx->audio_srtp.start(pw, srtp_salt);
+			ctx->video_srtp.start(pw, srtp_salt);
 			ctx->receiver->set_srtp_session(&ctx->video_srtp);
 		} else {
+			blog(LOG_WARNING, "phone-source: no SRTP salt available or no password, skipping SRTP");
 			ctx->receiver->set_srtp_session(nullptr);
 		}
 
@@ -722,10 +771,14 @@ void phone_source_update(void *data, obs_data_t *settings)
 	ctx->video_srtp.stop();
 
 	if (!new_password.empty()) {
-		ctx->audio_srtp.start(new_password);
-		ctx->video_srtp.start(new_password);
+		// Don't start SRTP here — no salt available until next handshake.
+		// The reconnect triggered below will re-handshake with Android,
+		// which will provide a fresh salt and start SRTP properly.
 
-		ctx->receiver->set_srtp_session(&ctx->video_srtp);
+		//ctx->audio_srtp.start(new_password);
+		//ctx->video_srtp.start(new_password);
+
+		// ctx->receiver->set_srtp_session(&ctx->video_srtp);
 	} else {
 		ctx->receiver->set_srtp_session(nullptr);
 	}
@@ -738,8 +791,13 @@ void phone_source_update(void *data, obs_data_t *settings)
 		// only reconnect if actually streaming
 		launchReconnectThread(ctx);
 	}
-
 	// If not running, just update the password — next stream start picks it up
+
+	// Always reset discovery so re-enabling auto on Android is picked up
+    if (!ctx->running) {
+        ctx->discovery->resetDiscoveryState();
+        ctx->discovery->resume();
+    }
 }
 
 void phone_source_get_defaults(obs_data_t *settings)
@@ -748,23 +806,61 @@ void phone_source_get_defaults(obs_data_t *settings)
 	obs_data_set_default_string(settings, "password", "");
 }
 
-obs_properties_t *phone_source_get_properties(void * /*data*/)
+
+// Callback that fires when the password field changes in the UI
+static bool password_changed(obs_properties_t *props, obs_property_t * /*p*/, obs_data_t *settings)
 {
+    const char* pw = obs_data_get_string(settings, "password");
+    obs_property_t* info = obs_properties_get(props, "info");
+
+    if (pw && pw[0] != '\0') {
+        obs_property_set_description(info,
+            "✅ Password set! Your video and audio stream will now be encrypted over SRTP.\n\n" 
+			"(Make sure the password in the app matches this one exactly or the stream won't start!)");
+    } else {
+        obs_property_set_description(info,
+            "⚠️ You MUST set a password here in order to encrypt your stream! " 
+			"This is the exact same password you'll use in the mobile app.\n\n"
+			"(Click 'OK' then re-open this window to refresh)");
+    }
+
+    return true; // true = tell OBS to redraw the properties panel
+}
+
+obs_properties_t *phone_source_get_properties(void * data)
+{
+	auto *ctx = static_cast<phone_source *>(data);
+
 	obs_properties_t *props = obs_properties_create();
 
 	obs_properties_add_int(props, "port", "RTP Port", 1024, 65535, 1);
 
 	// OBS_TEXT_PASSWORD renders as a masked field with a show/hide toggle
-	obs_properties_add_text(props, "password", "Stream Password (optional)",
-	                        OBS_TEXT_PASSWORD);
+	obs_property_t* pw_prop = obs_properties_add_text(props, "password",
+        "Stream Password", OBS_TEXT_PASSWORD);
 
-	obs_properties_add_text(props, "info",
-		"Leave password blank for no security.\n"
-		"If set, the Android app must use the same password.\n"
-		"Changing the password will reconnect the stream automatically.",
-		OBS_TEXT_INFO);
+	// Register the modified callback on the password field
+	//obs_property_set_modified_callback(pw_prop, password_changed);
 
-	return props;
+	// Correction: we can't do this since it makes entering the password
+	// miserable (you lose focus on the field every character you type)
+	// and there's no way in OBS to force focus back onto an object!
+	
+	// The logic we have now will make the message accurate upon opening the window.
+
+	// Initial state — read from ctx if available, otherwise assume empty
+    bool has_password = ctx && !ctx->password.empty();
+
+    obs_properties_add_text(props, "info",
+        has_password
+            ? "✅ Password set! Your video and audio stream will now be encrypted over SRTP.\n\n" 
+			"(Make sure the password in the app matches this one exactly or the stream won't start!)"
+            : "⚠️ You MUST set a password here in order to encrypt your stream! " 
+			"This is the exact same password you'll use in the mobile app.\n\n"
+			"(Click 'OK' then re-open this window to refresh)",
+        OBS_TEXT_INFO);
+
+    return props;
 }
 
 uint32_t phone_source_get_width(void *data)

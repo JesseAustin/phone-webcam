@@ -191,11 +191,18 @@ void HandshakeServer::listenLoop()
             }
         }
 
+        // Try to get a saltHex from the json:
+        std::string saltHex = jsonGetString(msg, "salt");
+        if (saltHex.empty()) {
+            blog(LOG_WARNING, "HandshakeServer: no salt field from %s — rejecting", phoneIp);
+            continue;
+        }
 
         // Auth passed (or no password set) — fire callback
-        blog(LOG_INFO, "HandshakeServer: valid request from %s", phoneIp);
+        blog(LOG_INFO, "HandshakeServer: valid request from %s, salt=%s", phoneIp, saltHex.c_str());
         if (running_ && callback_)
-            callback_(std::string(phoneIp));
+            callback_(std::string(phoneIp), saltHex);
+
     }
 
     closesocket(serverSocket_);

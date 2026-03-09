@@ -15,8 +15,8 @@ android {
         applicationId = "phone.webcam.phonewebcam"
         minSdk = 33
         targetSdk = 36
-        versionCode = 1
-        versionName = "0.0"
+        versionCode = 4
+        versionName = "0.3"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
