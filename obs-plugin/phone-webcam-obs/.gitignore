@@ -2,6 +2,9 @@
 build/
 cmake-build-*/
 
+# Backups
+backups/
+
 # IDE files
 .vs/
 .vscode/
