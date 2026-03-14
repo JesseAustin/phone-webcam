@@ -31,6 +31,7 @@ struct phone_source {
 	std::thread       handshake_thread;
 	std::atomic<bool> running{ false };
 	std::atomic<bool> reconnect_pending{ false };
+	std::atomic<bool> handshake_in_progress{ false };
 	std::atomic<bool> valid{ true };
 
 	// Settings

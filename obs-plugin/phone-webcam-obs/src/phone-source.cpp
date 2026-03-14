@@ -70,19 +70,14 @@ static void launchReconnectThread(phone_source* ctx)
 	if (ctx->reconnect_pending.exchange(true)) return;
 
 	// Don't block — if a handshake is in progress let it finish
-    if (ctx->handshake_thread.joinable()) {
+    if (ctx->handshake_in_progress) {
         blog(LOG_INFO, "Reconnect: skipping — handshake in progress");
         ctx->reconnect_pending = false;
         return;
     }
 
-
-    // Don't block — if previous reconnect thread is still running, skip
-    if (ctx->reconnect_thread.joinable()) {
-        blog(LOG_INFO, "Reconnect: skipping — previous reconnect still running");
-        ctx->reconnect_pending = false;
-        return;
-    }
+	if (ctx->reconnect_thread.joinable())
+    ctx->reconnect_thread.join();
 
 	ctx->reconnect_thread = std::thread([ctx]() {
 		if (!ctx || !ctx->valid) { ctx->reconnect_pending = false; return; }
@@ -547,7 +542,7 @@ void *phone_source_create(obs_data_t *settings, obs_source_t *source)
 		if (!ctx->valid) return;
 
 		// Guard BEFORE starting anything
-		if (ctx->handshake_thread.joinable()) {
+		if (ctx->handshake_in_progress) {
 			blog(LOG_INFO, "mDNS: skipping — previous handshake still in progress");
 			ctx->discovery->resume();
 			return;
@@ -576,8 +571,14 @@ void *phone_source_create(obs_data_t *settings, obs_source_t *source)
 			fresh_pw = ctx->password;
 		}
 
+		ctx->handshake_in_progress = true; 
+
+		// Join previous handshake thread if it finished but wasn't joined yet
+		if (ctx->handshake_thread.joinable())
+			ctx->handshake_thread.join();
+
 		ctx->handshake_thread = std::thread([ctx, ip_copy, port_copy, fresh_pw]() {
-			if (!ctx || !ctx->valid) return;
+			if (!ctx || !ctx->valid) { ctx->handshake_in_progress = false; return; }
 
 			if (!HandshakeClient::sendHandshake(ip_copy, port_copy, fresh_pw)) {
 				blog(LOG_WARNING, "Handshake failed to %s:%d", ip_copy.c_str(), (int)port_copy);
@@ -594,6 +595,7 @@ void *phone_source_create(obs_data_t *settings, obs_source_t *source)
 				if (ctx->valid && ctx->discovery)
 					ctx->discovery->resume();
 			}
+			ctx->handshake_in_progress = false;  // ← thread signals it's truly done
 		});
 	});
 
