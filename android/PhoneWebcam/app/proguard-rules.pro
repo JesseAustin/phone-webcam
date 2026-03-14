@@ -32,3 +32,8 @@
 # Use these rules to suppress warnings.
 -dontwarn javax.annotation.Nullable
 -dontwarn javax.annotation.concurrent.GuardedBy
+
+-keep class phone.webcam.phonewebcam.network.SrtpContext {
+    private long nativePtr;
+    native <methods>;
+}
