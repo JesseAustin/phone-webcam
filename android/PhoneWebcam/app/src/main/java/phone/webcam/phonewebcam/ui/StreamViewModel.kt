@@ -116,17 +116,6 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         _uiState.update { it.copy(supportedResolutions = supported, selectedResolution = validResolution) }
         savePreferences()
     }
-    /*
-    // Drop to 15fps when minimized to avoid queue backlog
-    fun minimizeStream() {
-        streamService?.dropTo15Fps()
-    }
-
-    // Return to 30fps when brought back to foreground
-    fun resumeStream() {
-        streamService?.returnTo30Fps()
-    }
-    */
 
     private val handshakeServer = HandshakeServer { ip, port ->
         Log.i(TAG, "Handshake: received from OBS — ip=$ip port=$port")
@@ -139,6 +128,11 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 if (!state.autoDiscoveryEnabled && state.targetPort != port) {
                     Log.w(TAG, "Port mismatch! App expects ${state.targetPort}, OBS is on $port. Ignoring.")
                     _uiState.update { it.copy(statusMessage = "Port Mismatch (OBS is on $port)") }
+                    return@launch
+                }
+
+                if (!state.autoDiscoveryEnabled && state.targetIp != ip) {
+                    Log.w(TAG, "IP mismatch in manual mode — expected ${state.targetIp}, got $ip. Ignoring.")
                     return@launch
                 }
 
@@ -161,9 +155,12 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 }
 
                 val newState = state.copy(
-                    targetIp = ip,
+                    targetIp = if (state.autoDiscoveryEnabled) ip else state.targetIp,
                     targetPort = if (state.autoDiscoveryEnabled) port else state.targetPort,
-                    statusMessage = "Linked with OBS at $ip"
+                    statusMessage = "Linked with OBS at $ip",
+                    lastLinkedIp = ip,
+                    lastLinkedPort = port,
+                    lastLinkedPassword = state.password
                 )
                 _uiState.value = newState
 
@@ -204,7 +201,13 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
                 PackageManager.PERMISSION_GRANTED
 
     fun updateIp(ip: String) {
-        _uiState.value = _uiState.value.copy(targetIp = ip)
+        _uiState.update { current ->
+            current.copy(
+                targetIp = ip,
+                statusMessage = if (!current.autoDiscoveryEnabled && !current.isStreaming)
+                    "Ready to stream" else current.statusMessage
+            )
+        }
         savePreferences()
 
         if (!uiState.value.autoDiscoveryEnabled && isValidIp(ip)) {
@@ -312,6 +315,10 @@ class StreamViewModel(application: Application) : AndroidViewModel(application) 
         val state = _uiState.value
         if (state.isStreaming) return
         if (state.targetIp.isBlank()) return
+        if (state.password.isEmpty()) {
+            _uiState.update { it.copy(statusMessage = "Set a password to stream!") }
+            return
+        }
 
         _uiState.update { it.copy(statusMessage = "Authenticating with OBS...") }
         initiateHandshake(state.targetIp, state.targetPort)
@@ -511,5 +518,10 @@ data class StreamUiState(
     val autoDiscoveryEnabled: Boolean = true,
     val isFrontCamera: Boolean = false,
     val isMicEnabled: Boolean = true,
-    val password: String = ""
+    val password: String = "",
+    // The IP and port OBS last successfully handshaked from — used to drive
+    // the "Ready to Stream" indicator in manual mode without relying on status strings.
+    val lastLinkedIp: String = "",
+    val lastLinkedPort: Int = 0,
+    val lastLinkedPassword: String = ""
 )

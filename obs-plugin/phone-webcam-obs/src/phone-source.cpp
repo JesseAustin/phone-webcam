@@ -37,6 +37,15 @@ static void launchReconnectThread(phone_source* ctx);
 static void startAudioThread(phone_source* ctx, uint16_t video_port);
 static void stopAudioThread(phone_source* ctx);
 
+static const char* PASSWORD_SET_MSG = "✅ Password set! Your video and audio stream will now be encrypted over SRTP.\n\n" 
+			"(Make sure the password in the app matches this one exactly or the stream won't start!)";
+
+
+static const char* NO_PASSWORD_MSG = "⚠️ You MUST set a password here in order to stream with your android device! " 
+			"This is the exact same password you'll use in the mobile app.\n\n"
+			"(Click 'OK' then re-open this window to refresh)";
+
+
 const char *phone_source_get_name(void * /*unused*/)
 {
 	return "Phone Webcam";
@@ -815,13 +824,10 @@ static bool password_changed(obs_properties_t *props, obs_property_t * /*p*/, ob
 
     if (pw && pw[0] != '\0') {
         obs_property_set_description(info,
-            "✅ Password set! Your video and audio stream will now be encrypted over SRTP.\n\n" 
-			"(Make sure the password in the app matches this one exactly or the stream won't start!)");
+            PASSWORD_SET_MSG);
     } else {
         obs_property_set_description(info,
-            "⚠️ You MUST set a password here in order to encrypt your stream! " 
-			"This is the exact same password you'll use in the mobile app.\n\n"
-			"(Click 'OK' then re-open this window to refresh)");
+            NO_PASSWORD_MSG);
     }
 
     return true; // true = tell OBS to redraw the properties panel
@@ -853,11 +859,8 @@ obs_properties_t *phone_source_get_properties(void * data)
 
     obs_properties_add_text(props, "info",
         has_password
-            ? "✅ Password set! Your video and audio stream will now be encrypted over SRTP.\n\n" 
-			"(Make sure the password in the app matches this one exactly or the stream won't start!)"
-            : "⚠️ You MUST set a password here in order to encrypt your stream! " 
-			"This is the exact same password you'll use in the mobile app.\n\n"
-			"(Click 'OK' then re-open this window to refresh)",
+            ? PASSWORD_SET_MSG
+            : NO_PASSWORD_MSG,
         OBS_TEXT_INFO);
 
     return props;

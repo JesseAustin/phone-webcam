@@ -21,6 +21,8 @@
 #endif
 #include <windows.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 #endif
 
 namespace Auth {
@@ -190,7 +192,9 @@ namespace Auth {
             CryptGenRandom(hProv,32,ch.data());
             CryptReleaseContext(hProv,0);
         } else {
-            for(auto& b:ch) b=(uint8_t)(rand()&0xFF);
+            // CryptAcquireContext failed — fall back to BCryptGenRandom which
+            // needs no context and is cryptographically secure on all modern Windows.
+            BCryptGenRandom(nullptr, ch.data(), 32, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
         }
     #else
         FILE* f=fopen("/dev/urandom","rb");

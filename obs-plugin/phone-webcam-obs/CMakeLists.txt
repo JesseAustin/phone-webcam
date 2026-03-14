@@ -134,6 +134,7 @@ if(WIN32)
         ws2_32
         dnsapi
         iphlpapi
+        bcrypt
     )
 elseif(APPLE)
     target_link_libraries(phone-webcam PRIVATE

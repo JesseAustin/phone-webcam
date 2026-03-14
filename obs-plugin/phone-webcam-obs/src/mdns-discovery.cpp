@@ -5,6 +5,8 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
+#pragma comment(lib, "iphlpapi.lib")
 #endif
 
 #include <chrono>
@@ -159,12 +161,74 @@ void MdnsDiscovery::discoveryLoop()
         return;
     }
 
-    ip_mreq mreq = {};
-    inet_pton(AF_INET, MDNS_ADDR_V4, &mreq.imr_multiaddr);
-    mreq.imr_interface.s_addr = INADDR_ANY;
-    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                   (const char*)&mreq, sizeof(mreq)) != 0) {
-        blog(LOG_WARNING, "mDNS: failed to join multicast group: %d", WSAGetLastError());
+    // Enumerate all active non-loopback IPv4 interfaces and join the multicast
+    // group on each one. Using INADDR_ANY for IP_ADD_MEMBERSHIP on Windows
+    // silently picks the loopback interface and misses LAN traffic entirely.
+    {
+        ULONG bufLen = 15000;
+        std::vector<uint8_t> addrBuf(bufLen);
+        PIP_ADAPTER_ADDRESSES addrs =
+            reinterpret_cast<PIP_ADAPTER_ADDRESSES>(addrBuf.data());
+
+        in_addr firstLanIface = {};
+        firstLanIface.s_addr  = INADDR_ANY; // fallback
+        int joinCount = 0;
+
+        if (GetAdaptersAddresses(AF_INET,
+                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST |
+                GAA_FLAG_SKIP_DNS_SERVER,
+                nullptr, addrs, &bufLen) == NO_ERROR)
+        {
+            for (auto* a = addrs; a != nullptr; a = a->Next) {
+                if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+                if (a->OperStatus != IfOperStatusUp)        continue;
+
+                for (auto* ua = a->FirstUnicastAddress;
+                     ua != nullptr; ua = ua->Next)
+                {
+                    auto* sa = ua->Address.lpSockaddr;
+                    if (sa->sa_family != AF_INET) continue;
+
+                    auto* sin4 = reinterpret_cast<sockaddr_in*>(sa);
+                    uint32_t ip = ntohl(sin4->sin_addr.s_addr);
+                    if ((ip >> 24) == 127) continue; // skip loopback
+
+                    ip_mreq mreq = {};
+                    inet_pton(AF_INET, MDNS_ADDR_V4, &mreq.imr_multiaddr);
+                    mreq.imr_interface = sin4->sin_addr;
+
+                    char ifIp[INET_ADDRSTRLEN] = {};
+                    inet_ntop(AF_INET, &sin4->sin_addr, ifIp, sizeof(ifIp));
+
+                    if (setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                                   (const char*)&mreq, sizeof(mreq)) == 0) {
+                        blog(LOG_INFO, "mDNS: joined multicast on interface %s", ifIp);
+                        if (joinCount == 0) firstLanIface = sin4->sin_addr;
+                        joinCount++;
+                    } else {
+                        blog(LOG_WARNING, "mDNS: failed to join multicast on %s: %d",
+                             ifIp, WSAGetLastError());
+                    }
+                }
+            }
+        }
+
+        if (joinCount == 0) {
+            // Absolute fallback — try INADDR_ANY so we at least attempt something
+            blog(LOG_WARNING, "mDNS: no LAN interfaces found, falling back to INADDR_ANY join");
+            ip_mreq mreq = {};
+            inet_pton(AF_INET, MDNS_ADDR_V4, &mreq.imr_multiaddr);
+            mreq.imr_interface.s_addr = INADDR_ANY;
+            setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                       (const char*)&mreq, sizeof(mreq));
+        } else {
+            // Pin outbound multicast sends to the first real LAN interface so
+            // Android sees the query arrive from our LAN IP, not 0.0.0.0
+            setsockopt(sock, IPPROTO_IP, IP_MULTICAST_IF,
+                       (const char*)&firstLanIface, sizeof(firstLanIface));
+        }
+
+        blog(LOG_INFO, "mDNS: joined multicast on %d interface(s)", joinCount);
     }
 
     u_long mode = 1;

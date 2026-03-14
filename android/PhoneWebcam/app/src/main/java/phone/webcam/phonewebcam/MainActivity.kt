@@ -35,6 +35,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.WifiOff
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -43,7 +44,8 @@ import android.content.res.Configuration
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.material.icons.filled.FlipCameraAndroid
+import androidx.compose.material.icons.filled.CameraFront
+import androidx.compose.material.icons.filled.CameraRear
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
@@ -174,14 +176,16 @@ fun StreamScreen(viewModel: StreamViewModel) {
                         .navigationBarsPadding()
                         .padding(horizontal = 16.dp, vertical = 12.dp)
                 ) {
+                    val noPassword = uiState.password.isEmpty() && !uiState.isStreaming
                     Button(
                         onClick = {
                             if (uiState.isStreaming) {
                                 viewModel.stopStreaming()
                             } else {
-                                viewModel.startStreaming()  // permission already handled at startup
+                                viewModel.startStreaming()
                             }
                         },
+                        enabled = !noPassword,
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(56.dp),
@@ -192,7 +196,9 @@ fun StreamScreen(viewModel: StreamViewModel) {
                         }
                     ) {
                         Text(
-                            text = if (uiState.isStreaming) "STOP STREAM" else "START STREAM",
+                            text = if (uiState.isStreaming) "STOP STREAM"
+                            else if (noPassword) "SET A PASSWORD TO STREAM"
+                            else "START STREAM",
                             style = MaterialTheme.typography.titleMedium
                         )
                     }
@@ -239,6 +245,17 @@ fun StreamScreen(viewModel: StreamViewModel) {
                         //selectedResolution = uiState.selectedResolution,
                         onSurfaceReady = { surface -> viewModel.setPreviewSurface(surface)
                         })
+
+                    // Grey overlay when not streaming — prevents frozen last-frame
+                    if (!uiState.isStreaming) {
+                        Box(
+                            modifier = Modifier
+                                .matchParentSize()
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(Color(0xCC1A1A1A))
+                        )
+                    }
+
                     IconButton(
                         onClick = { viewModel.toggleCamera() },
                         modifier = Modifier
@@ -246,8 +263,14 @@ fun StreamScreen(viewModel: StreamViewModel) {
                             .padding(8.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.FlipCameraAndroid,
-                            contentDescription = "Switch camera",
+                            imageVector = if (uiState.isFrontCamera)
+                                Icons.Default.CameraFront
+                            else
+                                Icons.Default.CameraRear,
+                            contentDescription = if (uiState.isFrontCamera)
+                                "Switch to rear camera"
+                            else
+                                "Switch to front camera",
                             tint = Color.White
                         )
                     }
@@ -264,6 +287,78 @@ fun StreamScreen(viewModel: StreamViewModel) {
                             contentDescription = if (uiState.isMicEnabled) "Mute mic" else "Unmute mic",
                             tint = if (uiState.isMicEnabled) Color.White else Color.Red
                         )
+                    }
+
+                    // LIVE badge — top start, only while streaming
+                    if (uiState.isStreaming) {
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .padding(8.dp)
+                                .background(
+                                    color = Color(0xFFCC0000),
+                                    shape = RoundedCornerShape(6.dp)
+                                )
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(7.dp)
+                                    .background(Color.White, shape = RoundedCornerShape(50))
+                            )
+                            Text(
+                                text = "LIVE",
+                                color = Color.White,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    // OBS link status indicator — bottom start, hidden while streaming (LIVE badge takes over)
+                    // Manual mode: all three fields must match what OBS last successfully handshaked with.
+                    // Auto mode: driven by status message since fields are filled by OBS automatically.
+                    val isObsLinked = if (uiState.autoDiscoveryEnabled) {
+                        uiState.targetIp.matches(Regex("""\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}""")) &&
+                                !uiState.statusMessage.startsWith("Waiting") &&
+                                !uiState.statusMessage.startsWith("Port Mismatch") &&
+                                !uiState.statusMessage.startsWith("Authenticating") &&
+                                !uiState.statusMessage.startsWith("Starting") &&
+                                uiState.statusMessage != "Ready to stream"
+                    } else {
+                        uiState.lastLinkedIp.isNotEmpty() &&
+                                uiState.targetIp == uiState.lastLinkedIp &&
+                                uiState.targetPort == uiState.lastLinkedPort &&
+                                uiState.password == uiState.lastLinkedPassword
+                    }
+                    if (!uiState.isStreaming) {
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .padding(8.dp)
+                                .background(
+                                    color = Color(0xCC2A2A2A),
+                                    shape = RoundedCornerShape(8.dp)
+                                )
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = if (isObsLinked) Icons.Default.Wifi else Icons.Default.WifiOff,
+                                contentDescription = null,
+                                tint = if (isObsLinked) Color(0xFF66FF66) else Color(0xFFAAAAAA),
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = if (isObsLinked) "Ready to Stream!" else "Waiting for OBS...",
+                                color = if (isObsLinked) Color(0xFF66FF66) else Color(0xFFCCCCCC),
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = androidx.compose.ui.text.font.FontWeight.Medium
+                            )
+                        }
                     }
                 }
 
@@ -313,13 +408,20 @@ fun StreamScreen(viewModel: StreamViewModel) {
                         )
 
                         // Port Input
+                        val portMismatch = uiState.statusMessage.startsWith("Port Mismatch")
                         OutlinedTextField(
-                            value = uiState.portText, // Use portText string
+                            value = uiState.portText,
                             onValueChange = { newValue ->
-                                // Fixes "Unresolved reference it" by naming the lambda parameter
                                 viewModel.updatePort(newValue)
                             },
-                            label = { Text("Port: \uD83D\uDEDC") },
+                            label = {
+                                Text(
+                                    "Port: \uD83D\uDEDC",
+                                    color = if (portMismatch) MaterialTheme.colorScheme.error
+                                    else Color.Unspecified
+                                )
+                            },
+                            isError = portMismatch,
                             keyboardOptions = KeyboardOptions(
                                 keyboardType = KeyboardType.Number,
                                 imeAction = ImeAction.Done
@@ -334,7 +436,6 @@ fun StreamScreen(viewModel: StreamViewModel) {
                                 .fillMaxWidth()
                                 .onFocusChanged { focusState ->
                                     if (!focusState.isFocused) {
-                                        // When the user clicks on IP or Password, fix the port if blank
                                         viewModel.finalizePort()
                                     }
                                 }
@@ -348,7 +449,7 @@ fun StreamScreen(viewModel: StreamViewModel) {
                             value = uiState.password,
                             onValueChange = { viewModel.updatePassword(it) },
                             label = { Text("Password: \uD83D\uDD10") },
-                            placeholder = { Text("Password required to encrypt stream!") },
+                            placeholder = { Text("Password required to stream!") },
                             visualTransformation = if (passwordVisible)
                                 VisualTransformation.None
                             else
