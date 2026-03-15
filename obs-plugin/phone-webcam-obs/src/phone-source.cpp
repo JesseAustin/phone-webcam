@@ -509,6 +509,7 @@ void *phone_source_create(obs_data_t *settings, obs_source_t *source)
 
 		blog(LOG_INFO, "Auto-discovered phone at %s:%d", ip.c_str(), port);
 		ctx->discovery->pause();
+		ctx->lastIp.clear();
 
 		std::lock_guard<std::mutex> lock(ctx->op_mutex);
 		if (!ctx->valid) return;
